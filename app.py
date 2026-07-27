@@ -25,7 +25,14 @@ from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 # Setup
 # ---------------------------------------------------
 load_dotenv()
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+
+# Try to load the token from Streamlit secrets first (used when deployed on
+# Streamlit Cloud). If not found, fall back to the local .env file.
+try:
+    GITHUB_TOKEN = st.secrets["GITHUB_TOKEN"]
+except (KeyError, FileNotFoundError):
+    GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+
 analyzer = SentimentIntensityAnalyzer()
 
 st.set_page_config(page_title="GitHub Sentiment Analyzer", layout="wide")
